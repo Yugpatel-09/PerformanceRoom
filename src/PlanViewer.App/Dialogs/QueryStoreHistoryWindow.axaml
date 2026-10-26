@@ -1,0 +1,13 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:PlanViewer.App.Controls"
+        x:Class="PlanViewer.App.Dialogs.QueryStoreHistoryWindow"
+        Title="Query Store History"
+        Width="1280" Height="800"
+        MinWidth="900" MinHeight="600"
+        WindowStartupLocation="CenterOwner"
+        Icon="avares://PlanViewer.App/EDD.ico"
+        Background="{DynamicResource BackgroundBrush}">
+
+    <controls:QueryStoreHistoryControl x:Name="HistoryControl"/>
+</Window>

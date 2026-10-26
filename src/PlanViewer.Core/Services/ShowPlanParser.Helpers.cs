@@ -1,0 +1,100 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Xml.Linq;
+using PlanViewer.Core.Models;
+
+namespace PlanViewer.Core.Services;
+
+public static partial class ShowPlanParser
+{
+    /// <summary>
+    /// Strips the internal padding and hex session suffix from temp table names.
+    /// SQL Server internally pads #temp names with underscores to 116 chars, then appends a hex suffix.
+    /// e.g. "#comment_sil_vous_plait_______________________________0000000000A86" → "#comment_sil_vous_plait"
+    /// </summary>
+    internal static string CleanTempTableName(string name)
+    {
+        if (name.Length == 0 || name[0] != '#') return name;
+
+        // Find the end of the real name: trim trailing hex suffix, then trailing underscores
+        // The hex suffix is 8-16 hex chars at the end; the padding is consecutive underscores before it
+        var i = name.Length - 1;
+
+        // Skip trailing hex digits (0-9, A-F, a-f)
+        while (i > 0 && IsHexDigit(name[i])) i--;
+
+        // Real SQL-internal #temp names always carry underscore padding between the visible
+        // name and the hex suffix. If there is no underscore right after the hex run, this is
+        // not that pattern (e.g. a user name that is itself all hex, like "#deadbeef1", or a
+        // table variable's internal name, like "#A1B2C3D4") — leave it untouched rather than
+        // stripping it down to "#". Ported from PerformanceMonitor b31e5d18.
+        if (i == 0 || name[i] != '_') return name;
+
+        // Skip trailing underscores (the padding)
+        while (i > 0 && name[i] == '_') i--;
+
+        // Only clean if we removed a meaningful amount (at least 8 chars of padding+hex) and a
+        // real name still remains — never collapse to just "#".
+        if (i > 0 && name.Length - i > 8)
+            return name[..(i + 1)];
+
+        return name;
+    }
+
+    private static bool IsHexDigit(char c) =>
+        (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+
+    internal static IEnumerable<XElement> ScopedDescendants(XElement element, XName name)
+    {
+        /* #589: a loop with its own stack, in document order. The recursive iterator this replaces
+           used stack for every level of nesting, and no depth guard counts these elements, so deep
+           nesting inside one operator overflowed even the parser thread's stack. */
+        var pending = new Stack<XElement>();
+        foreach (var child in element.Elements().Reverse())
+            pending.Push(child);
+
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (current.Name == Ns + "RelOp") continue;
+            if (current.Name == name) yield return current;
+            foreach (var child in current.Elements().Reverse())
+                pending.Push(child);
+        }
+    }
+
+    private static string? ParseColumnList(XElement parent, string elementName)
+    {
+        var el = parent.Element(Ns + elementName);
+        if (el == null) return null;
+        var cols = el.Elements(Ns + "ColumnReference")
+            .Select(c => FormatColumnRef(c))
+            .Where(s => !string.IsNullOrEmpty(s));
+        var result = string.Join(", ", cols);
+        return string.IsNullOrEmpty(result) ? null : result;
+    }
+
+    private static string FormatColumnRef(XElement colRef)
+    {
+        var col = colRef.Attribute("Column")?.Value ?? "";
+        var tbl = colRef.Attribute("Table")?.Value ?? "";
+        var result = string.IsNullOrEmpty(tbl) ? col : $"{tbl}.{col}";
+        return result.Replace("[", "").Replace("]", "");
+    }
+
+    private static double ParseDouble(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return 0;
+        return double.TryParse(value, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out var result) ? result : 0;
+    }
+
+    private static long ParseLong(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return 0;
+        return long.TryParse(value, System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out var result) ? result : 0;
+    }
+}

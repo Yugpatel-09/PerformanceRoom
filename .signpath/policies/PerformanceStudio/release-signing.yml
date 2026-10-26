@@ -1,0 +1,46 @@
+# SignPath GitHub policy for the "release-signing" signing policy.
+#
+# Path is significant and must match the SignPath project + policy slugs used in
+# .github/workflows/release.yml:
+#   project-slug:        PerformanceStudio
+#   signing-policy-slug: release-signing
+#
+# NOT ENFORCED. Since release.yml moved to v3 of
+# signpath/github-action-submit-signing-request (SignPath's Pipeline Connector),
+# SignPath reads this file only if the signing policy references it as a
+# Pipeline Policy (SignPath changelog, Pipeline Connector 0.8.0, 2026-09-09).
+# This organization is on SignPath's OSS subscription, and its dashboard shows
+# no Pipeline Policy setting (checked 2026-09-25), so nothing references this
+# file and SignPath does not check the rule below. The file records the intended
+# rule in case that setting becomes available. The v2 connector read this file
+# automatically, but only from the repository's default branch (main).
+#
+# What this file does NOT do: it does not enable automatic approval. Approval mode
+# lives on the signing policy in the SignPath dashboard, next to the checks that
+# do apply today: trusted build system, origin verification and allowed branch
+# names.
+
+github-policies:
+  runners:
+    # release.yml runs on `windows-latest`. Requiring GitHub-hosted runners means a
+    # self-hosted runner (which an attacker could register, or which could carry
+    # dirty state between jobs) can never produce a signed build.
+    require_github_hosted: true
+
+# Deliberately omitted, with reasons - do not add these without the matching
+# repository change, or releases will start failing to sign:
+#
+#   build.disallow_reruns: true
+#     Blocks signing any build produced by a workflow re-run. A re-run is the
+#     recovery path when signing fails for a temporary reason (for example an
+#     approval that timed out). release.yml creates the release only after
+#     signing succeeds, so a failed run has published nothing and a re-run is
+#     safe. SignPath limits this on its side anyway: it signs only a run's first
+#     3 attempts, and after that a fresh run (a new dev -> main merge) is needed.
+#
+#   branch_rulesets:
+#     Requires the protections it lists to actually exist on the branch, or
+#     every signing request is rejected. When this file was written `main` had
+#     no protection. It now has the "Protect main" ruleset (pull request
+#     required, no force pushes, no deletion), so those rules could be listed
+#     here.

@@ -1,0 +1,540 @@
+name: Release
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: write
+  id-token: write
+  actions: read
+
+jobs:
+  release:
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev'
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get version
+        id: version
+        shell: pwsh
+        run: |
+          $version = ([xml](Get-Content src/Directory.Build.props)).Project.PropertyGroup.Version | Where-Object { $_ }
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Check if release already exists
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v${{ steps.version.outputs.VERSION }}" > /dev/null 2>&1; then
+            echo "EXISTS=true" >> $GITHUB_OUTPUT
+          else
+            echo "EXISTS=false" >> $GITHUB_OUTPUT
+          fi
+
+      # NOTE: the release is deliberately NOT created here. It is created after
+      # signing succeeds, further down. Creating it up front meant a signing
+      # failure left a published, publicly-visible release with no app assets -
+      # which is exactly what happened to v1.17.0 when the SignPath approval
+      # window lapsed. Nothing before the signing step publishes anything now.
+
+      - name: Setup .NET 10.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build and test
+        run: |
+          dotnet restore
+          dotnet build -c Release
+          dotnet test tests/PlanViewer.Core.Tests/PlanViewer.Core.Tests.csproj -c Release --no-build --verbosity normal -- --hangdump --hangdump-timeout 5m --hangdump-type none
+
+      # ── planview CLI as a .NET tool (issue 645) ───────────────────────
+      #    Packed here, before anything is published, so a packaging failure
+      #    shows up early. continue-on-error: the tool is a convenience next
+      #    to the App, and a NuGet metadata problem must never block the App
+      #    release. The push to nuget.org is the last step of the job, after
+      #    every App asset is up. The package ID, tool name and metadata live
+      #    in PlanViewer.Cli.csproj; the version comes from Directory.Build.props.
+      #    The install at the end is a smoke test: a package that does not
+      #    install and run as a tool is not pushed, and the warning step at
+      #    the end of the job says so.
+      - name: Pack the planview CLI as a .NET tool
+        id: pack-cli
+        continue-on-error: true
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          dotnet pack src/PlanViewer.Cli/PlanViewer.Cli.csproj -c Release -o releases/nuget
+          $package = "releases/nuget/PerformanceStudio.Cli.$env:VERSION.nupkg"
+          if (-not (Test-Path $package)) {
+            throw "dotnet pack did not produce $package"
+          }
+          dotnet tool install PerformanceStudio.Cli --version $env:VERSION --tool-path tool-smoke --add-source releases/nuget --ignore-failed-sources
+          $reported = & tool-smoke/planview --version
+          if ($LASTEXITCODE -ne 0 -or -not "$reported".StartsWith($env:VERSION)) {
+            throw "the installed tool did not run or reported '$reported' instead of version $env:VERSION"
+          }
+          Write-Host "planview $reported installed from $package and ran."
+
+      - name: Publish App (all platforms)
+        run: |
+          dotnet publish src/PlanViewer.App/PlanViewer.App.csproj -c Release -r win-x64 --self-contained -o publish/win-x64
+          dotnet publish src/PlanViewer.App/PlanViewer.App.csproj -c Release -r linux-x64 --self-contained -o publish/linux-x64
+          dotnet publish src/PlanViewer.App/PlanViewer.App.csproj -c Release -r osx-x64 --self-contained -o publish/osx-x64
+          dotnet publish src/PlanViewer.App/PlanViewer.App.csproj -c Release -r osx-arm64 --self-contained -o publish/osx-arm64
+
+      # ── SSMS extension VSIX (issue 343 — get it into automated builds) ──
+      # PlanViewer.Ssms is a legacy non-SDK project and is not in PlanViewer.sln,
+      # so the `dotnet build` above never touches it. It needs full MSBuild plus
+      # the VSSDK build targets from the Microsoft.VSSDK.BuildTools package.
+      # The build step never fails the job (it only sets an output on success),
+      # so a VSIX build failure can never block the cross-platform app release.
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+        continue-on-error: true
+
+      - name: Build SSMS extension
+        id: ssms
+        continue-on-error: true
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          $manifest = 'src/PlanViewer.Ssms/source.extension.vsixmanifest'
+          $manifestVersion = ([xml](Get-Content $manifest)).PackageManifest.Metadata.Identity.Version
+          if ($manifestVersion -ne $env:VERSION) {
+            Write-Host "::warning::VSIX manifest version ($manifestVersion) does not match release version ($env:VERSION) - bump source.extension.vsixmanifest and Properties/AssemblyInfo.cs"
+          }
+
+          # Use -restore (not the -t:Restore,Build target list) so the
+          # package-generated props land in a fresh evaluation before Build.
+          # Those props redirect VSToolsPath into the Microsoft.VSSDK.BuildTools
+          # package, which is how the VSSDK targets resolve on a runner that
+          # lacks the Visual Studio extension-development workload.
+          $msbuildLog = Join-Path $env:RUNNER_TEMP 'ssms-msbuild.log'
+          msbuild src/PlanViewer.Ssms/PlanViewer.Ssms.csproj -restore -t:Build -p:Configuration=Release -p:DeployExtension=false | Tee-Object -FilePath $msbuildLog
+          $auditHit = Select-String -Path $msbuildLog -Pattern 'NU1903|NU1904' | Select-Object -First 1
+          if ($auditHit) {
+            Write-Host "::warning::SSMS restore failed the NuGet audit: $($auditHit.Line.Trim())"
+          }
+          dotnet build src/PlanViewer.Ssms.Installer/PlanViewer.Ssms.Installer.csproj -c Release
+
+          $vsix = 'src/PlanViewer.Ssms/bin/Release/PlanViewer.Ssms.vsix'
+          $exe  = 'src/PlanViewer.Ssms.Installer/bin/Release/net472/InstallSsmsExtension.exe'
+          if ((Test-Path $vsix) -and (Test-Path $exe)) {
+            New-Item -ItemType Directory -Force -Path releases | Out-Null
+            Copy-Item $vsix 'releases/PlanViewer.Ssms.vsix'
+            Copy-Item $exe  'releases/InstallSsmsExtension.exe'
+            "BUILT=true" >> $env:GITHUB_OUTPUT
+            Write-Host "SSMS extension built: $vsix"
+          } else {
+            Write-Host "::warning::SSMS extension did not produce the expected artifacts - the release will be published without the VSIX (issue 343)"
+          }
+
+      # The VSIX is built above but NOT uploaded here — uploading requires the
+      # release to exist, and the release is not created until signing succeeds.
+      # Both uploads happen after the signing step.
+
+      # ── SignPath code signing (Windows). Signing is REQUIRED for a release:
+      #    if the SignPath token is missing the job fails loudly rather than
+      #    silently shipping unsigned binaries. ──
+      - name: Verify signing is configured
+        shell: bash
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          if [ -z "$SIGNPATH_API_TOKEN" ]; then
+            echo "::error::SIGNPATH_API_TOKEN missing — signing is required for a release; aborting."
+            exit 1
+          fi
+          echo "SignPath token present — Windows binaries will be signed."
+
+      - name: Upload Windows build for signing
+        id: upload-unsigned
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: App-unsigned
+          path: publish/win-x64/
+
+      # v3 of this action talks to SignPath's Pipeline Connector, which needs the
+      # SignPath GitHub App installed on this repository (v2's connector did not).
+      # Without it every attempt fails with "Failed to retrieve GitHub App token".
+      # SignPath signs only a run's first 3 attempts: if signing keeps failing,
+      # fix the cause and start a fresh run (a new dev -> main merge) instead of
+      # re-running the same one.
+      - name: Sign Windows build
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '7969f8b6-d946-4a74-9bac-a55856d8b8e0'
+          project-slug: 'PerformanceStudio'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'App'
+          github-artifact-id: '${{ steps.upload-unsigned.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'signed/win-x64'
+          # The action's 600s default means a signing policy that requires manual
+          # approval has to be approved inside a 10-minute window or the job
+          # fails. Before the release was moved after signing, that left a
+          # published release with no app assets (v1.17.0). 30 minutes is enough
+          # to notice the mail and approve. Irrelevant once approval is automatic,
+          # but harmless.
+          wait-for-completion-timeout-in-seconds: 1800
+
+      - name: Replace unsigned Windows build with signed
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force publish/win-x64
+          Copy-Item -Recurse signed/win-x64 publish/win-x64
+
+      # ── Velopack (packs the signed Windows build) ─────────────────────
+      #    Packing runs before the release is created, so the executables it
+      #    generates are signed before anything is published. ──
+      - name: Create Velopack release (Windows)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          # Pin vpk to match the Velopack PackageReference (Velopack recommends the
+          # CLI and library versions match for compatible packages + reproducible releases).
+          dotnet tool install -g vpk --version 1.2.161
+          New-Item -ItemType Directory -Force -Path releases/velopack
+
+          # Download previous release for delta generation
+          vpk download github --repoUrl https://github.com/${{ github.repository }} --channel win -o releases/velopack --token $env:GH_TOKEN
+
+          # Pack Windows release (now signed)
+          vpk pack -u PerformanceStudio -v $env:VERSION -p publish/win-x64 -e PlanViewer.App.exe -o releases/velopack --channel win
+
+      # `vpk pack` generates three executables: Setup.exe, and the launcher
+      # (PerformanceStudio.exe) and Update.exe at the root of Portable.zip. They
+      # do not exist when the App is signed above, so they shipped unsigned
+      # through v1.28.0. The steps below sign them in one more SignPath request
+      # and write them back. PerformanceMonitor does the same (its #3288), and
+      # both scripts come from there.
+      #
+      # The launcher stub and Squirrel.exe inside the .nupkg stay unsigned.
+      # releases.win.json records the .nupkg's SHA256 and size, and the delta is
+      # built against those bytes, so the .nupkg must not change after packing.
+      # Nothing records a hash for Setup.exe or Portable.zip.
+      #
+      # Unlike the SSMS signing below, this is required, like the App signing:
+      # if a step fails or the approval times out, the job stops here, before
+      # the release is created.
+      - name: Collect the executables Velopack generates
+        shell: pwsh
+        run: python .github/scripts/postpack_signing.py collect --stage postpack/unsigned --manifest postpack/manifest.json --product studio=releases/velopack
+
+      - name: Upload the Velopack-generated executables for signing
+        id: upload-postpack
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Velopack-generated-unsigned
+          path: postpack/unsigned/
+
+      # Same organization, project, policy and timeout as the App request. The
+      # "SignTemplate" artifact configuration on signpath.io Authenticode-signs
+      # every .exe and .dll in the artifact, with min-matches="0". So an empty
+      # artifact would sign nothing and still succeed, and the collect step
+      # refuses to stage an empty set for that reason.
+      - name: Sign the executables Velopack generates
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '7969f8b6-d946-4a74-9bac-a55856d8b8e0'
+          project-slug: 'PerformanceStudio'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'SignTemplate'
+          github-artifact-id: '${{ steps.upload-postpack.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'postpack/signed'
+          wait-for-completion-timeout-in-seconds: 1800
+
+      # Setup.exe is overwritten. Portable.zip is rebuilt entry by entry: every
+      # entry that is not replaced keeps its original bytes, and the rebuilt zip
+      # is checked against the original before it replaces it.
+      - name: Write the signed Velopack executables back
+        shell: pwsh
+        run: python .github/scripts/postpack_signing.py apply --signed postpack/signed --manifest postpack/manifest.json
+
+      # Fails the job if any .exe in the Velopack output has no signature,
+      # including the ones inside Portable.zip and the .nupkg files. The only
+      # exceptions are the two .nupkg members described above.
+      - name: Assert every Velopack executable is signed
+        shell: pwsh
+        run: python .github/scripts/verify_release_signatures.py --verify-dir releases/velopack
+
+      # ── SignPath code signing for the SSMS extension and its installer.
+      #    Unlike the App, this is best-effort. If a step below fails, or an
+      #    approval times out, the release still goes out with the unsigned
+      #    files (as it did before these were signed) and a warning annotation
+      #    says so. The one exception is in the replace step: if it cannot put
+      #    the unsigned files back after a failed copy or a failed signature
+      #    check, the job stops before anything is published. Each SignPath
+      #    request needs a manual approval, so a release run now waits for three:
+      #    the App, then the executables Velopack generates, then these two
+      #    files. ──
+      - name: Stage SSMS files for signing
+        if: steps.ssms.outputs.BUILT == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # Exactly these two files, at the root of one folder. The SignPath
+          # "Vsix" artifact configuration matches them by that root-relative path.
+          New-Item -ItemType Directory -Force -Path ssms-unsigned | Out-Null
+          Copy-Item releases/InstallSsmsExtension.exe ssms-unsigned/InstallSsmsExtension.exe
+          Copy-Item releases/PlanViewer.Ssms.vsix ssms-unsigned/PlanViewer.Ssms.vsix
+
+      - name: Upload SSMS files for signing
+        id: upload-ssms-unsigned
+        if: steps.ssms.outputs.BUILT == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Ssms-unsigned
+          path: ssms-unsigned/
+          if-no-files-found: error
+
+      # Same organization, project, policy and timeout as the App request above.
+      # Only the artifact configuration differs. "Vsix" is a zip whose root holds
+      # InstallSsmsExtension.exe (Authenticode) and PlanViewer.Ssms.vsix (OPC
+      # signature, plus Authenticode on PlanViewer.Ssms.dll, which sits at the
+      # root of the VSIX).
+      - name: Sign SSMS extension and installer
+        id: sign-ssms
+        if: steps.ssms.outputs.BUILT == 'true'
+        continue-on-error: true
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '7969f8b6-d946-4a74-9bac-a55856d8b8e0'
+          project-slug: 'PerformanceStudio'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'Vsix'
+          github-artifact-id: '${{ steps.upload-ssms-unsigned.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'signed/ssms'
+          wait-for-completion-timeout-in-seconds: 1800
+
+      # Copy the signed files over the ones in releases/ only when signing
+      # succeeded (steps.<id>.outcome is the result before continue-on-error, so
+      # it is never 'success' for a failed step). Every later step reads the
+      # files from releases/: the release upload, the SSMS Gallery upload and the
+      # checksums.
+      - name: Replace unsigned SSMS files with signed
+        if: steps.ssms.outputs.BUILT == 'true' && steps.sign-ssms.outcome == 'success'
+        shell: pwsh
+        run: |
+          # Copy both files or neither, so one signed file never ships beside an
+          # unsigned one. The signed installer must also accept the signed VSIX:
+          # --verify-only runs the installer's signature check and installs
+          # nothing. If a copy or that check fails, put the unsigned pair back
+          # from ssms-unsigned/. If that fails too, the step fails and the job
+          # stops before the release is created, so a mixed pair is never
+          # published.
+          $names = 'InstallSsmsExtension.exe', 'PlanViewer.Ssms.vsix'
+          $missing = @($names | Where-Object { -not (Test-Path "signed/ssms/$_") })
+          if ($missing.Count -gt 0) {
+            Write-Host "::warning::SignPath reported success but these signed files are missing: $($missing -join ', '). PlanViewer.Ssms.vsix and InstallSsmsExtension.exe shipped unsigned."
+          } else {
+            try {
+              foreach ($name in $names) {
+                Copy-Item "signed/ssms/$name" "releases/$name" -Force -ErrorAction Stop
+              }
+              & releases/InstallSsmsExtension.exe --verify-only releases/PlanViewer.Ssms.vsix
+              if ($LASTEXITCODE -ne 0) {
+                throw "the installer rejected the signed VSIX with exit code $LASTEXITCODE (the reason is in the log above)"
+              }
+              Write-Host 'Replaced the SSMS extension and installer with the signed files.'
+            } catch {
+              $problem = $_.Exception.Message
+              foreach ($name in $names) {
+                Copy-Item "ssms-unsigned/$name" "releases/$name" -Force -ErrorAction Stop
+              }
+              # The failed check left a non-zero exit code, and the shell ends the
+              # script with `exit $LASTEXITCODE`. The failure is handled, so reset it.
+              $global:LASTEXITCODE = 0
+              Write-Host "::warning::Could not use the signed SSMS files: $problem. PlanViewer.Ssms.vsix and InstallSsmsExtension.exe shipped unsigned."
+            }
+          }
+
+      - name: Warn that SSMS files are unsigned
+        if: steps.ssms.outputs.BUILT == 'true' && steps.sign-ssms.outcome != 'success'
+        shell: pwsh
+        env:
+          SIGN_OUTCOME: ${{ steps.sign-ssms.outcome }}
+        run: |
+          Write-Host "::warning::SSMS signing did not succeed (result: $env:SIGN_OUTCOME). PlanViewer.Ssms.vsix and InstallSsmsExtension.exe shipped unsigned."
+
+      # ── Everything above this line is reversible: nothing has been published.
+      #    The release is created only now that signed binaries exist. ──
+      - name: Create release
+        if: steps.check.outputs.EXISTS == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.version.outputs.VERSION }}" --title "v${{ steps.version.outputs.VERSION }}" --generate-notes --target main
+
+      # releases/ holds the signed copies here when the SSMS signing above succeeded.
+      # continue-on-error: the release exists by now, so a failed SSMS upload must
+      # not stop the App files from being uploaded below.
+      - name: Upload SSMS extension to release
+        if: steps.ssms.outputs.BUILT == 'true'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: gh release upload "v$env:VERSION" releases/PlanViewer.Ssms.vsix releases/InstallSsmsExtension.exe --clobber
+
+      # Publish to the SSMS Gallery (https://ssmsgallery.azurewebsites.net, issue 343).
+      # The gallery extracts version/description from the vsixmanifest, so the
+      # upload filename is irrelevant. continue-on-error: a gallery outage must
+      # never fail the release. bash so `curl` is curl.exe, not the pwsh alias.
+      - name: Publish SSMS extension to SSMS Gallery
+        if: steps.ssms.outputs.BUILT == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Uploading PlanViewer.Ssms.vsix to the SSMS Gallery..."
+          curl -sS -f "https://ssmsgallery.azurewebsites.net/api/upload" \
+            -F "file=@releases/PlanViewer.Ssms.vsix"
+
+      # ── Package and upload ────────────────────────────────────────────
+      - name: Package and upload
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          SSMS_BUILT: ${{ steps.ssms.outputs.BUILT }}
+        run: |
+          New-Item -ItemType Directory -Force -Path releases
+
+          # Windows (signed): flat zip via Compress-Archive. Windows has no Unix
+          # execute bit, so the signed .exe needs no special handling.
+          if (Test-Path 'README.md') { Copy-Item 'README.md' 'publish/win-x64/' }
+          if (Test-Path 'LICENSE') { Copy-Item 'LICENSE' 'publish/win-x64/' }
+          Compress-Archive -Path 'publish/win-x64/*' -DestinationPath 'releases/PerformanceStudio-win-x64.zip' -Force
+
+          # Linux: flat zip via zip_with_exec.py so the apphost keeps its execute
+          # bit. Compress-Archive (and .NET's ZipArchive) stamp the archive's host
+          # byte as Windows, so unzip/macOS/Linux drop the Unix mode and the binary
+          # extracts non-executable -- it then won't launch ("permission denied").
+          if (Test-Path 'README.md') { Copy-Item 'README.md' 'publish/linux-x64/' }
+          if (Test-Path 'LICENSE') { Copy-Item 'LICENSE' 'publish/linux-x64/' }
+          python .github/scripts/zip_with_exec.py publish/linux-x64 releases/PerformanceStudio-linux-x64.zip --exec PlanViewer.App --exec-optional createdump
+
+          # Package macOS as proper .app bundles
+          foreach ($rid in @('osx-x64', 'osx-arm64')) {
+            $appName = "PerformanceStudio.app"
+            $bundleDir = "publish/$rid-bundle/$appName"
+
+            # Create .app bundle structure
+            New-Item -ItemType Directory -Force -Path "$bundleDir/Contents/MacOS"
+            New-Item -ItemType Directory -Force -Path "$bundleDir/Contents/Resources"
+
+            # Copy all published files into Contents/MacOS
+            Copy-Item -Path "publish/$rid/*" -Destination "$bundleDir/Contents/MacOS/" -Recurse
+
+            # Move Info.plist to Contents/ (it was copied to MacOS/ with the publish output)
+            if (Test-Path "$bundleDir/Contents/MacOS/Info.plist") {
+              Move-Item -Path "$bundleDir/Contents/MacOS/Info.plist" -Destination "$bundleDir/Contents/Info.plist" -Force
+            }
+
+            # Update version in Info.plist to match csproj
+            $plist = Get-Content "$bundleDir/Contents/Info.plist" -Raw
+            $plist = $plist -replace '(<key>CFBundleVersion</key>\s*<string>)[^<]*(</string>)', "`${1}$env:VERSION`${2}"
+            $plist = $plist -replace '(<key>CFBundleShortVersionString</key>\s*<string>)[^<]*(</string>)', "`${1}$env:VERSION`${2}"
+            Set-Content -Path "$bundleDir/Contents/Info.plist" -Value $plist -NoNewline
+
+            # Move icon to Contents/Resources
+            if (Test-Path "$bundleDir/Contents/MacOS/EDD.icns") {
+              Move-Item -Path "$bundleDir/Contents/MacOS/EDD.icns" -Destination "$bundleDir/Contents/Resources/EDD.icns" -Force
+            }
+
+            # Add README and LICENSE alongside the .app bundle
+            $wrapperDir = "publish/$rid-bundle"
+            if (Test-Path 'README.md') { Copy-Item 'README.md' "$wrapperDir/" }
+            if (Test-Path 'LICENSE') { Copy-Item 'LICENSE' "$wrapperDir/" }
+
+            # Zip the bundle with zip_with_exec.py so the apphost inside the .app
+            # keeps its execute bit (Compress-Archive would strip it, leaving a
+            # bundle macOS refuses to launch).
+            python .github/scripts/zip_with_exec.py "$wrapperDir" "releases/PerformanceStudio-$rid.zip" --exec "PerformanceStudio.app/Contents/MacOS/PlanViewer.App" --exec-optional "PerformanceStudio.app/Contents/MacOS/createdump"
+          }
+
+          # Checksums: the zips, plus the SSMS extension and installer when they
+          # were built (the signed copies when signing succeeded). Velopack has
+          # its own checksums.
+          $files = @(Get-ChildItem releases/*.zip)
+          if ($env:SSMS_BUILT -eq 'true') {
+            $files += Get-Item releases/PlanViewer.Ssms.vsix, releases/InstallSsmsExtension.exe
+          }
+          $checksums = $files | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          }
+          # LF line endings and no BOM. Out-File writes CRLF on Windows, and then
+          # `sha256sum -c` and `shasum -c` on Linux and macOS read the \r as part
+          # of each file name and report every file as missing. nightly.yml
+          # writes its SHA256SUMS.txt the same way; keep the two in step.
+          [IO.File]::WriteAllText("$PWD/releases/SHA256SUMS.txt", (($checksums -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+          Write-Host "Checksums:"
+          $checksums | ForEach-Object { Write-Host $_ }
+
+          # Upload zips + checksums
+          gh release upload "v$env:VERSION" releases/*.zip releases/SHA256SUMS.txt --clobber
+
+          # Upload Velopack artifacts
+          vpk upload github --repoUrl https://github.com/${{ github.repository }} --channel win -o releases/velopack --releaseName "v$env:VERSION" --tag "v$env:VERSION" --merge --token $env:GH_TOKEN
+
+      # ── planview tool package to nuget.org (issue 645) ────────────────
+      #    Trusted Publishing: NuGet/login exchanges this job's GitHub OIDC
+      #    token (permissions: id-token: write, at the top) for a nuget.org API
+      #    key that lives one hour, so no long-lived key is stored anywhere.
+      #    The nuget.org side is a Trusted Publishing policy on the package
+      #    owner's account for repository Yugpatel-09/PerformanceRoom and
+      #    workflow file release.yml. NUGET_USER is a repository variable, not
+      #    a secret: the nuget.org username (profile name, not the email) that
+      #    owns that policy. Both steps are best-effort: the release and every
+      #    App asset exist by now, so a nuget.org outage or a missing policy
+      #    costs only this package, and the warning step below says so.
+      - name: Log in to nuget.org
+        id: nuget-login
+        if: steps.pack-cli.outcome == 'success'
+        continue-on-error: true
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      # --skip-duplicate: a re-run of a release whose package is already on
+      # nuget.org must not fail here.
+      - name: Push the planview tool package to nuget.org
+        id: push-cli
+        if: steps.pack-cli.outcome == 'success' && steps.nuget-login.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: dotnet nuget push "releases/nuget/PerformanceStudio.Cli.$env:VERSION.nupkg" --source https://api.nuget.org/v3/index.json --api-key $env:NUGET_API_KEY --skip-duplicate
+
+      - name: Warn that the planview tool package was not published
+        if: steps.pack-cli.outcome != 'success' || steps.nuget-login.outcome != 'success' || steps.push-cli.outcome != 'success'
+        shell: pwsh
+        env:
+          PACK: ${{ steps.pack-cli.outcome }}
+          LOGIN: ${{ steps.nuget-login.outcome }}
+          PUSH: ${{ steps.push-cli.outcome }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          Write-Host "::warning::The planview tool package was not published to nuget.org (pack: $env:PACK, nuget.org login: $env:LOGIN, push: $env:PUSH). The App release is complete. Fix the cause, then push releases/nuget/PerformanceStudio.Cli.$env:VERSION.nupkg by hand or re-run this workflow."

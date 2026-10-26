@@ -1,0 +1,56 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>EDD.ico</ApplicationIcon>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" />
+    <PackageReference Include="Avalonia.AvaloniaEdit" />
+    <PackageReference Include="Avalonia.Controls.DataGrid" />
+    <PackageReference Include="ScottPlot.Avalonia" />
+    <PackageReference Include="Avalonia.Desktop" />
+    <PackageReference Include="Avalonia.Themes.Fluent" />
+    <PackageReference Include="Avalonia.Fonts.Inter" />
+    <PackageReference Include="AvaloniaEdit.TextMate" />
+    <PackageReference Include="BlackwellSystems.Gcf" />
+    <PackageReference Include="Meziantou.Framework.Win32.CredentialManager" />
+    <PackageReference Include="ModelContextProtocol" />
+    <PackageReference Include="ModelContextProtocol.AspNetCore" />
+    <PackageReference Include="TextMateSharp.Grammars" />
+    <PackageReference Include="Microsoft.SqlServer.TransactSql.ScriptDom" />
+    <PackageReference Include="Velopack" />
+
+    <!-- This pin is inert under Avalonia 12 and kept anyway. Avalonia.Skia 12.1.2 already
+         requires SkiaSharp and SkiaSharp.NativeAssets.Linux 3.119.4 itself, so the pin no
+         longer raises any floor it did not already meet. It also has no lever over the
+         collision it was written for: issue #139 is ScottPlot's
+         SkiaSharp.NativeAssets.Linux.NoDependencies 3.119.0, a DIFFERENT package id that
+         ships its own libSkiaSharp.so at the same runtimes path, and a PackageReference on
+         one id cannot constrain the other. Which of the two wins a publish is NuGet's
+         choice, not this pin's. Measured on the Avalonia 12 bump: a linux-x64 self-contained
+         publish takes the 3.119.4 file, hash-identical to this package's copy and different
+         from the NoDependencies one, so the pairing with managed SkiaSharp 3.119.4 is
+         intact. The pin stays because the underlying collision is unresolved and removing it
+         is out of the scope of that migration, not because it prevents anything. -->
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AvaloniaResource Include="EDD.ico" />
+    <None Update="EDD.icns" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Info.plist" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PlanViewer.Core\PlanViewer.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PlanViewer.Core.Tests" />
+  </ItemGroup>
+</Project>

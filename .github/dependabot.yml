@@ -1,0 +1,129 @@
+version: 2
+
+# Coverage note: PlanViewer.sln does NOT contain server/PlanShare, PlanViewer.Ssms,
+# PlanViewer.Ssms.Installer or its tests, so any solution-level scan silently skips them.
+# Every project directory is therefore listed explicitly below. If a new .csproj
+# is added anywhere, add its directory here too.
+#
+# target-branch is REQUIRED on every entry here. Without it Dependabot opens PRs
+# against the *default* branch, which is `main` — and in this repo `main` is only
+# ever updated by a dev -> main release merge. Omitting it once already put two
+# dependency bumps directly onto `main`, behind `dev`.
+updates:
+  - package-ecosystem: nuget
+    target-branch: dev
+    directories:
+      - "/src/PlanViewer.App"
+      - "/src/PlanViewer.Core"
+      - "/src/PlanViewer.Cli"
+      - "/src/PlanViewer.Web"
+      - "/src/PlanViewer.Ssms"
+      - "/src/PlanViewer.Ssms.Installer"
+      - "/tests/PlanViewer.Core.Tests"
+      - "/tests/PlanViewer.Ssms.Installer.Tests"
+      - "/server/PlanShare"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+    # One PR per batch instead of per package. Majors stay separate so a breaking
+    # change is never buried in a routine batch.
+    groups:
+      patch-and-minor:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # --- Deliberate pins. Removing an ignore here without doing the matching
+      #     migration will produce a PR that builds but breaks at runtime. ---
+
+      # An Avalonia major is a migration, not a version bump. 11 -> 12 (#549)
+      # changed behavior in ways that still compiled, and only behavior tests
+      # and a GUI test pass caught them. Take 12.x servicing, and do the next
+      # major by hand. This pattern covers AvaloniaEdit too, but not
+      # ScottPlot.Avalonia. When a ScottPlot.Avalonia PATCH starts to require
+      # the next Avalonia major, restore fails with NU1605 and takes the whole
+      # grouped PR down with it. Pin that version with a `versions` ignore
+      # until the migration, as 5.1.59 was pinned while Avalonia 12 waited.
+      - dependency-name: "Avalonia*"
+        update-types:
+          - version-update:semver-major
+
+      # Pinned to keep the native libs in the [119.0, 120.0) range that managed
+      # SkiaSharp 3.x requires. A 4.x bump reintroduces GitHub issue #139
+      # (TypeInitializationException on Linux at startup).
+      - dependency-name: "SkiaSharp.NativeAssets.*"
+        update-types:
+          - version-update:semver-major
+
+      # The VSIX targets VS 2022. The 18.x line targets VS 18 and is not
+      # restorable from nuget.org, so the 17.x line is intentional.
+      - dependency-name: "Microsoft.VisualStudio.SDK"
+        update-types:
+          - version-update:semver-major
+      - dependency-name: "Microsoft.VSSDK.BuildTools"
+        update-types:
+          - version-update:semver-major
+
+      # The Velopack library version must move in lockstep with the `vpk` CLI
+      # pin in .github/workflows/release.yml. A PR bumping only the library
+      # would desync them and can produce incompatible update packages, so this
+      # one is handled by hand.
+      - dependency-name: "Velopack"
+
+      # BlackwellSystems.Gcf transforms every MCP tool result when
+      # PLANVIEWER_OUTPUT_FORMAT=gcf is set, and it is maintained by the same
+      # external contributor who introduced it (#501). Dependabot PRs skip the
+      # AI review gate (claude-code-review.yml), so an auto-bump would put new
+      # third-party code on that path with build+test as the only gate. Bump it
+      # by hand in a reviewed PR instead.
+      - dependency-name: "BlackwellSystems.Gcf"
+
+      # Repl / Repl.Mcp / Repl.Testing (#388) are pre-1.0. Under semver a 0.x
+      # minor bump is allowed to break, and Dependabot classifies 0.11 -> 0.12
+      # as a *minor*, so the usual "majors only get their own PR" split does not
+      # protect anything here. Patch bumps still flow, so genuine fixes arrive.
+      # This matters more than for a normal dependency: the app ships an
+      # auto-updater, so a breaking bump reaches users without them choosing it.
+      - dependency-name: "Repl"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+      - dependency-name: "Repl.Mcp"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+      - dependency-name: "Repl.Testing"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+
+  - package-ecosystem: github-actions
+    target-branch: dev
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

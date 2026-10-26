@@ -1,0 +1,489 @@
+using System.CommandLine;
+using System.Diagnostics;
+using System.Text.Json;
+using Microsoft.Data.SqlClient;
+using PlanViewer.Core.Output;
+using PlanViewer.Core.Interfaces;
+using PlanViewer.Core.Models;
+using PlanViewer.Core.Services;
+
+namespace PlanViewer.Cli.Commands;
+
+public static class AnalyzeCommand
+{
+    /* #430: the depth ceiling and the null handling both live on AnalysisJson now. They used to be
+       built here, which is how the identical pair in QueryStoreCommand got missed when #430 was
+       fixed — see AnalysisJson.IndentedWithoutNulls. */
+    private static readonly JsonSerializerOptions JsonOptions = AnalysisJson.IndentedWithoutNulls;
+
+    private static readonly JsonSerializerOptions CompactJsonOptions = AnalysisJson.CompactWithoutNulls;
+
+    public static Command Create(ICredentialService? credentialService = null)
+    {
+        var fileArg = new Argument<FileInfo?>("file")
+        {
+            Description = "Path to a .sqlplan file, .sql file, or directory of .sql files",
+            Arity = ArgumentArity.ZeroOrOne
+        };
+
+        var stdinOption = new Option<bool>("--stdin")
+        {
+            Description = "Read plan XML from stdin"
+        };
+
+        var outputOption = PlanAnalysisRunner.CreateOutputOption(
+            "Output format. With --server, both writes a .json and a .txt file per plan. Without --server, both prints json",
+            defaultFormat: "json");
+
+        var compactOption = new Option<bool>("--compact")
+        {
+            Description = "Compact JSON output (no indentation)"
+        };
+
+        var warningsOnlyOption = new Option<bool>("--warnings-only")
+        {
+            Description = "Only output warnings and missing indexes, skip operator tree"
+        };
+
+        // Live execution options
+        var serverOption = new Option<string?>("--server", "-s")
+        {
+            Description = "Server name (matches credential store key)"
+        };
+
+        var databaseOption = new Option<string?>("--database", "-d")
+        {
+            Description = "Database context for execution"
+        };
+
+        var queryOption = new Option<string?>("--query", "-q")
+        {
+            Description = "Inline SQL text to execute"
+        };
+
+        var outputDirOption = new Option<DirectoryInfo?>("--output-dir")
+        {
+            Description = "Directory for output files (default: current directory)"
+        };
+
+        var estimatedOption = new Option<bool>("--estimated")
+        {
+            Description = "Use estimated plan (SET SHOWPLAN XML ON) instead of actual plan"
+        };
+
+        var authOption = new Option<string?>("--auth")
+        {
+            Description = "Authentication type: windows, sql, entra (default: auto-detect)"
+        };
+
+        var trustCertOption = new Option<bool>("--trust-cert")
+        {
+            Description = "Trust the server certificate (for dev/test environments)"
+        };
+
+        var timeoutOption = new Option<int>("--timeout")
+        {
+            Description = "Query timeout in seconds",
+            DefaultValueFactory = _ => 60
+        };
+
+        var loginOption = new Option<string?>("--login")
+        {
+            Description = "SQL Server login name (bypasses credential store)"
+        };
+
+        var passwordOption = new Option<string?>("--password")
+        {
+            Description = "SQL Server password (bypasses credential store). Visible in process listings — prefer --password-stdin."
+        };
+
+        var passwordStdinOption = new Option<bool>("--password-stdin")
+        {
+            Description = "Read the SQL Server password from stdin (avoids process-listing exposure). Mutually exclusive with --password."
+        };
+
+        var configOption = new Option<string?>("--config")
+        {
+            Description = "Path to .planview.json config file (overrides auto-discovery)"
+        };
+
+        var cmd = new Command("analyze", "Analyze a SQL Server execution plan")
+        {
+            fileArg,
+            stdinOption,
+            outputOption,
+            compactOption,
+            warningsOnlyOption,
+            serverOption,
+            databaseOption,
+            queryOption,
+            outputDirOption,
+            estimatedOption,
+            authOption,
+            trustCertOption,
+            timeoutOption,
+            loginOption,
+            passwordOption,
+            passwordStdinOption,
+            configOption
+        };
+
+        cmd.SetAction(async (parseResult, ct) =>
+        {
+            var file = parseResult.GetValue(fileArg);
+            var stdin = parseResult.GetValue(stdinOption);
+            var output = PlanAnalysisRunner.ReadOutputFormat(parseResult, outputOption, "json");
+            var compact = parseResult.GetValue(compactOption);
+            var warningsOnly = parseResult.GetValue(warningsOnlyOption);
+            var server = parseResult.GetValue(serverOption);
+            var database = parseResult.GetValue(databaseOption);
+            var query = parseResult.GetValue(queryOption);
+            var outputDir = parseResult.GetValue(outputDirOption);
+            var estimated = parseResult.GetValue(estimatedOption);
+            var auth = parseResult.GetValue(authOption);
+            var trustCert = parseResult.GetValue(trustCertOption);
+            var timeout = parseResult.GetValue(timeoutOption);
+            var login = parseResult.GetValue(loginOption);
+            var passwordInline = parseResult.GetValue(passwordOption);
+            var passwordStdin = parseResult.GetValue(passwordStdinOption);
+            var configPath = parseResult.GetValue(configOption);
+
+            // Load analyzer config
+            AnalyzerConfig analyzerConfig;
+            try
+            {
+                analyzerConfig = ConfigLoader.Load(configPath);
+            }
+            catch (Exception ex) when (ex is System.IO.FileNotFoundException or System.IO.InvalidDataException)
+            {
+                Console.Error.WriteLine(ex.Message);
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            // Load .env file if present (CLI args take precedence)
+            var env = ConnectionHelper.LoadEnvFile();
+            if (env.Error is { } envError)
+            {
+                Console.Error.WriteLine(envError);
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            var settings = env.Fill(new ConnectionSettings(server, database, login, trustCert));
+            (server, database, login, trustCert) = settings;
+
+            // Resolve password from --password-stdin, --password, or PLANVIEW_PASSWORD
+            // (in that order). --stdin for plan XML conflicts with --password-stdin.
+            if (!PasswordResolver.TryResolve(
+                    passwordInline, passwordStdin, stdin,
+                    () => env.PasswordFor(settings),
+                    out var password))
+            {
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            // A .env file can pick the server and turn off certificate validation, so say when it did.
+            if (env.Notice is { } envNotice)
+                Console.Error.WriteLine(envNotice);
+
+            if (server != null)
+            {
+                await RunLiveAsync(file, server, database, query, outputDir, estimated,
+                    auth, trustCert, timeout, output, compact, warningsOnly,
+                    credentialService, login, password, analyzerConfig);
+            }
+            else
+            {
+                await RunAsync(file, stdin, output, compact, warningsOnly, analyzerConfig);
+            }
+        });
+
+        return cmd;
+    }
+
+    #region File/Stdin Analysis (existing)
+
+    private static async Task RunAsync(FileInfo? file, bool stdin, string output, bool compact, bool warningsOnly, AnalyzerConfig analyzerConfig)
+    {
+        string planXml;
+        string source;
+
+        if (stdin || (file == null && Console.IsInputRedirected))
+        {
+            planXml = await Console.In.ReadToEndAsync();
+            source = "stdin";
+        }
+        else if (file != null)
+        {
+            if (!file.Exists)
+            {
+                Console.Error.WriteLine($"File not found: {file.FullName}");
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            planXml = await File.ReadAllTextAsync(file.FullName);
+            source = file.Name;
+        }
+        else
+        {
+            Console.Error.WriteLine("Provide a .sqlplan file path or use --stdin");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(planXml))
+        {
+            Console.Error.WriteLine("Empty plan XML");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        var plan = PlanAnalysisRunner.Analyze(planXml, analyzerConfig);
+
+        // Covers a plan that failed to parse and a plan with no statements, with the same messages as before.
+        if (PlanAnalysisRunner.ParseFailure(plan) is { } parseFailure)
+        {
+            Console.Error.WriteLine(parseFailure);
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        var result = ResultMapper.Map(plan, source);
+
+        if (warningsOnly)
+        {
+            foreach (var stmt in result.Statements)
+                stmt.OperatorTree = null;
+        }
+
+        if (output == "text")
+        {
+            TextFormatter.WriteText(result, Console.Out);
+        }
+        else
+        {
+            var opts = compact ? CompactJsonOptions : JsonOptions;
+            string json;
+            try
+            {
+                json = PlanAnalysisRunner.SerializeResult(result, opts);
+            }
+            catch (InvalidOperationException exception)
+            {
+                Console.Error.WriteLine(exception.Message);
+                Environment.ExitCode = 1;
+                return;
+            }
+            Console.WriteLine(json);
+        }
+    }
+
+    #endregion
+
+    #region Live Execution
+
+    private static async Task RunLiveAsync(
+        FileInfo? fileOrDir, string server, string? database, string? query,
+        DirectoryInfo? outputDir, bool estimated, string? auth, bool trustCert,
+        int timeout, string outputFormat, bool compact, bool warningsOnly,
+        ICredentialService? credentialService, string? login, string? password,
+        AnalyzerConfig analyzerConfig)
+    {
+        if (timeout < 0)
+        {
+            Console.Error.WriteLine("--timeout must be >= 0");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        if (string.IsNullOrEmpty(database))
+        {
+            Console.Error.WriteLine("--database is required when using --server");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        // Build connection string
+        string connectionString;
+        if (!string.IsNullOrEmpty(login))
+        {
+            // Direct login/password — bypass credential store entirely
+            connectionString = ConnectionHelper.BuildConnectionString(server, database, login, password ?? "", trustCert, multipleActiveResultSets: true);
+        }
+        else if (credentialService != null)
+        {
+            try
+            {
+                var connection = CliConnectionResolver.BuildServerConnection(server, auth, trustCert, credentialService);
+                connectionString = connection.GetConnectionString(credentialService, database);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(ex.Message);
+                Environment.ExitCode = 1;
+                return;
+            }
+        }
+        else
+        {
+            Console.Error.WriteLine("No credentials provided. " + CredentialCommand.NoStoreMessage);
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        // Determine inputs
+        var sqlInputs = new List<(string Name, string SqlText)>();
+
+        if (!string.IsNullOrEmpty(query))
+        {
+            sqlInputs.Add(("inline-query", query));
+        }
+        else if (fileOrDir == null)
+        {
+            Console.Error.WriteLine("Provide a .sql file, directory, or --query with --server");
+            Environment.ExitCode = 1;
+            return;
+        }
+        else if (Directory.Exists(fileOrDir.FullName))
+        {
+            // Directory: batch all *.sql files
+            var sqlFiles = Directory.GetFiles(fileOrDir.FullName, "*.sql")
+                .OrderBy(f => f)
+                .ToArray();
+
+            if (sqlFiles.Length == 0)
+            {
+                Console.Error.WriteLine($"No .sql files found in {fileOrDir.FullName}");
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            foreach (var sqlFile in sqlFiles)
+            {
+                var sqlText = await File.ReadAllTextAsync(sqlFile);
+                sqlInputs.Add((Path.GetFileNameWithoutExtension(sqlFile), sqlText));
+            }
+        }
+        else if (fileOrDir.Exists)
+        {
+            var ext = fileOrDir.Extension.ToLowerInvariant();
+            if (ext == ".sqlplan")
+            {
+                // Redirect to existing file analysis path
+                await RunAsync(fileOrDir, false, outputFormat, compact, warningsOnly, analyzerConfig);
+                return;
+            }
+            if (ext != ".sql")
+            {
+                Console.Error.WriteLine($"Unsupported file type: {ext}. Use .sql or .sqlplan");
+                Environment.ExitCode = 1;
+                return;
+            }
+            var text = await File.ReadAllTextAsync(fileOrDir.FullName);
+            sqlInputs.Add((Path.GetFileNameWithoutExtension(fileOrDir.Name), text));
+        }
+        else
+        {
+            Console.Error.WriteLine($"File or directory not found: {fileOrDir.FullName}");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        // Resolve output directory
+        var outDir = outputDir?.FullName ?? Directory.GetCurrentDirectory();
+        Directory.CreateDirectory(outDir);
+
+        var isAzure = CliConnectionResolver.IsAzureSqlDb(server);
+        var planType = estimated ? "estimated" : "actual";
+        Console.Error.WriteLine($"Capturing {planType} plans from {server}/{database}");
+
+        // Fetch server metadata for Rule 38 (Standard Edition DOP limitation)
+        var serverMetadata = await CliConnectionResolver.FetchServerMetadataAsync(connectionString, server);
+
+        Console.Error.WriteLine();
+
+        // Process each SQL input sequentially
+        var total = sqlInputs.Count;
+        var errors = 0;
+
+        for (int i = 0; i < total; i++)
+        {
+            var (name, sqlText) = sqlInputs[i];
+            var label = total > 1 ? $"[{i + 1}/{total}] {name}" : name;
+
+            try
+            {
+                Console.Error.Write($"{label} ... ");
+                var sw = Stopwatch.StartNew();
+
+                // Capture plan
+                string? planXml;
+                if (estimated)
+                {
+                    planXml = await EstimatedPlanExecutor.GetEstimatedPlanAsync(
+                        connectionString, database, sqlText, timeout);
+                }
+                else
+                {
+                    planXml = await ActualPlanExecutor.ExecuteForActualPlanAsync(
+                        connectionString, database, sqlText,
+                        planXml: null, isolationLevel: null,
+                        isAzureSqlDb: isAzure, timeoutSeconds: timeout,
+                        CancellationToken.None);
+                }
+
+                sw.Stop();
+
+                if (string.IsNullOrEmpty(planXml))
+                {
+                    Console.Error.WriteLine($"NO PLAN ({sw.Elapsed.TotalSeconds:F1}s)");
+                    errors++;
+                    continue;
+                }
+
+                // Write .sqlplan file
+                var planPath = Path.Combine(outDir, $"{name}.sqlplan");
+                await File.WriteAllTextAsync(planPath, planXml);
+
+                /* Parse, analyze, map result. This path just executed sqlText itself, so a
+                   single-statement query past the showplan cap gets its full text in the output
+                   instead of the plan's 4,000-character stub (#502). */
+                var plan = PlanAnalysisRunner.Analyze(planXml, analyzerConfig, serverMetadata);
+                if (PlanAnalysisRunner.ParseFailure(plan) is { } parseFailure)
+                    throw new InvalidOperationException(parseFailure);
+                var result = ResultMapper.Map(plan, $"{name}.sql", capturedQueryText: sqlText);
+
+                await PlanAnalysisRunner.WriteResultFilesAsync(
+                    result, outDir, name, outputFormat, compact ? CompactJsonOptions : JsonOptions, warningsOnly);
+
+                Console.Error.WriteLine($"OK ({sw.Elapsed.TotalSeconds:F1}s)");
+            }
+            catch (SqlException ex)
+            {
+                Console.Error.WriteLine($"SQL ERROR: {ex.Message}");
+                errors++;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"ERROR: {ex.Message}");
+                errors++;
+            }
+        }
+
+        // Summary
+        if (total > 1)
+        {
+            Console.Error.WriteLine();
+            Console.Error.WriteLine($"Processed {total} files: {total - errors} succeeded, {errors} failed");
+        }
+        Console.Error.WriteLine($"Output: {outDir}");
+
+        if (errors > 0)
+            Environment.ExitCode = 1;
+    }
+
+    #endregion
+}

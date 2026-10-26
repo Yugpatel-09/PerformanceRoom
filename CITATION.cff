@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+title: "SQL Server Performance Room"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - given-names: Yug
+    family-names: Patel
+    affiliation: "Yug Patel"
+    website: "https://github.com/Yugpatel-09"
+repository-code: "https://github.com/Yugpatel-09/PerformanceRoom"
+license: MIT
+version: "1.31.0"
+date-released: "2026-10-20"
+keywords:
+  - sql-server
+  - execution-plan
+  - query-plan-analyzer
+  - query-optimization
+  - mcp-server
+  - cross-platform
+  - dba-tools

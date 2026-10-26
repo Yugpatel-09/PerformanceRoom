@@ -1,0 +1,41 @@
+<Project>
+
+  <!-- MSBuild stops at the nearest Directory.Build.props, so chain to the repo-root one (NuGet audit settings, #650). -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+  <!--
+    Single source of truth for product version + identity across src/ projects.
+
+    Picked up automatically by SDK-style projects in this folder and below:
+      PlanViewer.App, PlanViewer.Core, PlanViewer.Cli, PlanViewer.Web,
+      PlanViewer.Ssms.Installer.
+
+    PlanViewer.Ssms is a legacy non-SDK project. It imports this file too, through
+    Microsoft.Common.props, which is how it gets the NuGet audit settings from the
+    repo-root file. But a legacy project does not generate assembly attributes from
+    <Version>, so its version lives in:
+      Properties/AssemblyInfo.cs   (AssemblyVersion + AssemblyFileVersion)
+      source.extension.vsixmanifest (Identity Version="...")
+    Bump those manually when bumping the version here.
+
+    Tests and server/ projects are outside src/. They pick up the repo-root
+    Directory.Build.props directly and never see the version block below.
+  -->
+  <PropertyGroup>
+    <Version>1.31.0</Version>
+    <Authors>Yug Patel</Authors>
+    <Company>Yug Patel</Company>
+    <Product>Performance Room</Product>
+    <Copyright>Copyright (c) 2026 Yug Patel</Copyright>
+  </PropertyGroup>
+
+  <!--
+    Silence AVLN3001 ("XAML resource won't be reachable via runtime loader,
+    no public constructor was found"). All flagged controls take typed
+    constructor dependencies (ServerConnection, ICredentialService, ...) and
+    are instantiated directly in code-behind — they're never loaded via
+    AvaloniaXamlLoader.Load() and the IDE previewer isn't used.
+  -->
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);AVLN3001</NoWarn>
+  </PropertyGroup>
+</Project>

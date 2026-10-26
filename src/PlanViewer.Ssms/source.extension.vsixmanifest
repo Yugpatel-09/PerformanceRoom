@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011"
+                 xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
+  <Metadata>
+    <Identity Id="PlanViewer.Ssms.64F79022-9D9A-4463-A1AE-4B19426A0CB1"
+              Version="1.31.0"
+              Language="en-US"
+              Publisher="Yug Patel" />
+    <DisplayName>Performance Room for SSMS</DisplayName>
+    <Description xml:space="preserve">Adds "Open in Performance Room" to the execution plan right-click menu in SSMS. Extracts the plan XML and opens it in Performance Room for advanced analysis. Compatible with SSMS 21 and SSMS 22.</Description>
+    <MoreInfo>https://github.com/Yugpatel-09/PerformanceRoom</MoreInfo>
+    <License>LICENSE.txt</License>
+    <Icon>Resources\PerformanceStudioIcon.png</Icon>
+    <Tags>SQL Server, Execution Plan, Performance, SSMS</Tags>
+  </Metadata>
+  <Installation>
+    <!-- Version is the SSMS product version, not the VS shell version: [21.0,23.0) = SSMS 21 and 22. -->
+    <InstallationTarget Id="Microsoft.VisualStudio.Ssms" Version="[21.0,23.0)">
+      <ProductArchitecture>amd64</ProductArchitecture>
+    </InstallationTarget>
+    <InstallationTarget Id="Microsoft.VisualStudio.Ssms" Version="[21.0,23.0)">
+      <ProductArchitecture>arm64</ProductArchitecture>
+    </InstallationTarget>
+  </Installation>
+  <Prerequisites>
+    <Prerequisite Id="Microsoft.VisualStudio.Component.CoreEditor"
+                  Version="[14.0,)"
+                  DisplayName="Visual Studio core editor" />
+  </Prerequisites>
+  <Assets>
+    <Asset Type="Microsoft.VisualStudio.VsPackage" d:Source="Project" d:ProjectName="%CurrentProject%" Path="|%CurrentProject%;PkgdefProjectOutputGroup|" />
+    <Asset Type="Microsoft.VisualStudio.MefComponent" d:Source="Project" d:ProjectName="%CurrentProject%" Path="|%CurrentProject%|" />
+  </Assets>
+</PackageManifest>

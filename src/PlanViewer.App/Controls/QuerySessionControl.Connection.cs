@@ -1,0 +1,235 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Input.Platform;
+using Avalonia.Interactivity;
+using Avalonia.Layout;
+using Avalonia.Media;
+using AvaloniaEdit;
+using AvaloniaEdit.CodeCompletion;
+using AvaloniaEdit.TextMate;
+using Microsoft.Data.SqlClient;
+using PlanViewer.App.Dialogs;
+using PlanViewer.App.Services;
+using PlanViewer.Core.Interfaces;
+using PlanViewer.Core.Models;
+using PlanViewer.Core.Output;
+using PlanViewer.Core.Services;
+using TextMateSharp.Grammars;
+
+namespace PlanViewer.App.Controls;
+
+public partial class QuerySessionControl : UserControl
+{
+    private async void Connect_Click(object? sender, RoutedEventArgs e)
+    {
+        await ShowConnectionDialogAsync();
+    }
+
+    private async Task ShowConnectionDialogAsync()
+    {
+        // Pass the session's current database so a reconnect comes back to it rather than master.
+        var dialog = new ConnectionDialog(_credentialService, _connectionStore, _selectedDatabase);
+        var result = await dialog.ShowDialog<bool?>(GetParentWindow());
+
+        if (result == true && dialog.ResultConnection != null)
+        {
+            _serverConnection = dialog.ResultConnection;
+            _selectedDatabase = dialog.ResultDatabase;
+            _connectionString = _serverConnection.GetConnectionString(_credentialService, _selectedDatabase);
+
+            /* A new holder for a new connection, made here rather than at the fetch below so a
+               document opened while the fetch is still in flight already has the right one to
+               read, and handed to the fetch as a parameter so an offset that lands after ANOTHER
+               reconnect fills this connection's holder and not the newer one's (E5). The
+               connection string is captured for the same reason. */
+            var serverOffset = BeginServerConnection();
+            var offsetConnectionString = _connectionString;
+
+            /* A database metadata fetch still running from before this reconnect was built from
+               the previous server's connection string. Left alone it can land after
+               FetchServerMetadataAsync below has replaced _serverMetadata, and write the old
+               server's database rows into the new server's metadata (E7). The fetch this block
+               makes itself is the newest pick and owns the result. */
+            _databaseMetadataCts?.Cancel();
+
+            ServerLabel.Text = _serverConnection.ApplicationIntentReadOnly
+                ? $"{_serverConnection.ServerName} (Read-only)"
+                : _serverConnection.ServerName;
+            /* The label sits in a width-pinned slot so connecting cannot shove the rest of the
+               toolbar sideways, which means a long server name ellipsizes — the hover is where
+               the rest of it has to live. */
+            ToolTip.SetTip(ServerLabel, ServerLabel.Text);
+            ServerLabel.Foreground = Token("SuccessBrush", Brushes.LimeGreen);
+            ConnectButton.Content = Helpers.AppIcons.MakeContent(Helpers.AppIcons.Connect, "Reconnect");
+
+            /* Connecting is the one way a fresh session stops being empty without a keystroke
+               or a document, so neither of the overlay's other triggers will fire — without
+               this, the "Get started" panel keeps covering the editor and offering "Connect to
+               a server" on a session that just did (#540). Before the awaits below, so the
+               editor appears the moment the dialog closes rather than after three round trips
+               to the server. */
+            RefreshEmptyState();
+
+            /* The dialog only closes with true after it opened this connection and enumerated
+               these databases — through the database the user named, which is the one some
+               logins (Azure SQL DB, JIT access) can open when master is off limits. Asking
+               again here through a second, hardcoded-master connection was a wasted round trip
+               whose swallowed failure left a green toolbar over a dead database picker. */
+            DatabaseBox.ItemsSource = dialog.ResultDatabases;
+            DatabaseBox.IsEnabled = true;
+
+            await FetchServerMetadataAsync();
+            await FetchServerUtcOffset(offsetConnectionString, serverOffset);
+
+            if (_selectedDatabase != null)
+            {
+                for (int i = 0; i < DatabaseBox.Items.Count; i++)
+                {
+                    if (DatabaseBox.Items[i]?.ToString() == _selectedDatabase)
+                    {
+                        DatabaseBox.SelectedIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            await FetchDatabaseMetadataAsync();
+
+            ExecuteButton.IsEnabled = true;
+            ExecuteEstButton.IsEnabled = true;
+
+            /* Here, at the end, rather than beside the connection string at the top of this block:
+               _serverMetadata is not the new server's until FetchServerMetadataAsync above has
+               returned, and an Overview rebuilt inside that window would ask the OLD server what it
+               supports and hold that answer for the rest of the session. */
+            InvalidateOverviewView();
+        }
+    }
+
+    private async void Database_SelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (_serverConnection == null || DatabaseBox.SelectedItem == null) return;
+
+        _selectedDatabase = DatabaseBox.SelectedItem.ToString();
+        _connectionString = _serverConnection.GetConnectionString(_credentialService, _selectedDatabase);
+
+        // Refresh database metadata for the new context
+        await FetchDatabaseMetadataAsync();
+    }
+
+    /// <summary>
+    /// Selects <paramref name="db"/> in the database picker if it is one of the databases the
+    /// picker already knows about, using the same match the connect block above uses to restore
+    /// a remembered database. Selecting it runs <see cref="Database_SelectionChanged"/> exactly
+    /// as a user's own pick would, which is what actually sets <c>_selectedDatabase</c> and
+    /// <c>_connectionString</c> and refreshes the metadata — so this never writes either field
+    /// itself. Returns whether a match was found; the Overview's drill-down
+    /// (QuerySessionControl.Views.cs) opens its Query Store tab either way, so a database the
+    /// picker does not know about — one created after connect, most likely — just leaves the
+    /// session on whatever database it already had (E1).
+    /// </summary>
+    internal bool TrySelectDrilledDatabase(string db)
+    {
+        for (int i = 0; i < DatabaseBox.Items.Count; i++)
+        {
+            if (DatabaseBox.Items[i]?.ToString() == db)
+            {
+                DatabaseBox.SelectedIndex = i;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private async Task FetchServerMetadataAsync()
+    {
+        if (_connectionString == null) return;
+        try
+        {
+            _serverMetadata = await ServerMetadataService.FetchServerMetadataAsync(
+                _connectionString, IsAzureConnection);
+        }
+        catch
+        {
+            // Non-fatal — advice will just lack server context
+            _serverMetadata = null;
+        }
+    }
+
+    /// <summary>
+    /// Starts the offset holder for a new connection. A connect replaces the holder instead of
+    /// reusing it: documents already open keep the old one, because their data came from the old
+    /// server, and documents opened from here on get this one. Internal so a test can connect
+    /// without a server — the connect block calls this and nothing else makes a holder (E5).
+    /// </summary>
+    internal ServerUtcOffset BeginServerConnection()
+    {
+        _serverOffset = new ServerUtcOffset();
+        return _serverOffset;
+    }
+
+    /// <summary>
+    /// Asks the server it just connected to for its offset from UTC and fills
+    /// <paramref name="target"/> with it. Takes the connection string and the holder rather than
+    /// reading the session's fields, so the answer lands on the connection that asked even if the
+    /// session has reconnected in the meantime. A failed query leaves the holder at zero.
+    /// </summary>
+    private static async Task FetchServerUtcOffset(string? connectionString, ServerUtcOffset target)
+    {
+        if (connectionString == null) return;
+        try
+        {
+            await using var conn = new SqlConnection(connectionString);
+            await conn.OpenAsync();
+            await using var cmd = new SqlCommand(
+                "SELECT DATEDIFF(MINUTE, GETUTCDATE(), GETDATE())", conn);
+            var offset = await cmd.ExecuteScalarAsync();
+            if (offset is int mins)
+                target.Minutes = mins;
+        }
+        catch { }
+    }
+
+    private async Task FetchDatabaseMetadataAsync()
+    {
+        if (_connectionString == null || _serverMetadata == null) return;
+
+        /* The database picker can change again before this lands — Database_SelectionChanged
+           calls this on every pick, and nothing stopped an older fetch from landing after a
+           newer one and overwriting _serverMetadata.Database with the wrong database's rows
+           (E7). Same shape as the Query Store grid's own database check
+           (QueryStoreGridControl.QsDatabase_SelectionChanged). Cancelled, never disposed: the
+           older fetch reads its own token when it wakes, and Token on a disposed source throws. */
+        _databaseMetadataCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _databaseMetadataCts = cts;
+
+        try
+        {
+            var database = await ServerMetadataService.FetchDatabaseMetadataAsync(
+                _connectionString, _serverMetadata.SupportsScopedConfigs, cts.Token);
+            if (cts.Token.IsCancellationRequested) return; // superseded — the newer pick owns this
+
+            _serverMetadata.Database = database;
+        }
+        catch (OperationCanceledException)
+        {
+            // superseded — the newer pick owns this
+        }
+        catch
+        {
+            // Non-fatal — advice will just lack database context
+        }
+    }
+}

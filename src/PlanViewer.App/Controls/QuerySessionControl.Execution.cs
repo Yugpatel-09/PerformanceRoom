@@ -1,0 +1,371 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Avalonia.Controls;
+using Avalonia.Input.Platform;
+using Avalonia.Interactivity;
+using AvaloniaEdit;
+using AvaloniaEdit.CodeCompletion;
+using AvaloniaEdit.TextMate;
+using PlanViewer.App.Dialogs;
+using PlanViewer.App.Helpers;
+using PlanViewer.App.Services;
+using PlanViewer.Core.Interfaces;
+using PlanViewer.Core.Models;
+using PlanViewer.Core.Output;
+using PlanViewer.Core.Services;
+using TextMateSharp.Grammars;
+
+namespace PlanViewer.App.Controls;
+
+public partial class QuerySessionControl : UserControl
+{
+    private async void Execute_Click(object? sender, RoutedEventArgs e)
+    {
+        await CaptureAndShowPlan(estimated: false);
+    }
+
+    private async void ExecuteEstimated_Click(object? sender, RoutedEventArgs e)
+    {
+        await CaptureAndShowPlan(estimated: true);
+    }
+
+    /// <summary>
+    /// Starts a run: cancels the one before it, and hands back the source the new one runs on.
+    /// </summary>
+    /// <remarks>
+    /// Cancelled, never disposed. The loading tab a run opens keeps a Cancel button and an Escape
+    /// handler that close over this source, and they outlive the run — a failed capture leaves its
+    /// tab on screen. Cancel on a disposed source throws, so a later run disposing this one would
+    /// turn that tab's Escape into an exception. Same rule as
+    /// <see cref="FetchDatabaseMetadataAsync"/> and the Overview's refresh.
+    /// </remarks>
+    private CancellationTokenSource BeginRun()
+    {
+        _executionCts?.Cancel();
+        var run = new CancellationTokenSource();
+        _executionCts = run;
+        return run;
+    }
+
+    /// <summary>
+    /// Whether an Escape pressed right now is about the session's current run: the editor is what
+    /// is showing, which is where the run was started from, or the document showing is the tab
+    /// that owns it. Escape anywhere else belongs to whatever is there.
+    /// </summary>
+    private bool EscapeBelongsToCurrentRun() =>
+        _surface == SessionSurface.Editor
+        || (SelectedDocument is { } document
+            && _tabRuns.TryGetValue(document, out var run)
+            && ReferenceEquals(run, _executionCts));
+
+    private async Task CaptureAndShowPlan(bool estimated, string? queryTextOverride = null)
+    {
+        if (_serverConnection == null || _selectedDatabase == null)
+        {
+            SetErrorStatus("Connect to a server first");
+            return;
+        }
+
+        // Always rebuild connection string from current database selection
+        // to guarantee the picker state is reflected at execution time
+        _connectionString = _serverConnection.GetConnectionString(_credentialService, _selectedDatabase);
+
+        var queryText = queryTextOverride?.Trim()
+                        ?? GetSelectedTextOrNull()?.Trim()
+                        ?? QueryEditor.Text?.Trim();
+        if (string.IsNullOrEmpty(queryText))
+        {
+            SetErrorStatus("Enter a query");
+            return;
+        }
+
+        var runCts = BeginRun();
+        var ct = runCts.Token;
+
+        var planType = estimated ? "Estimated" : "Actual";
+
+        // Create loading tab with cancel button
+        var progress = new Helpers.CaptureProgressPanel(this, $"Capturing {planType.ToLower()} plan...", runCts);
+
+        // Add loading tab and switch to it
+        _planCounter++;
+        var tabLabel = estimated ? $"Est Plan {_planCounter}" : $"Plan {_planCounter}";
+        var loadingTab = NewPlanTab(tabLabel, progress.Root);
+        _tabRuns.AddOrUpdate(loadingTab, runCts);
+
+        AddDocument(loadingTab);
+        SelectDocument(loadingTab);
+        progress.Root.Focus();
+
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            string? planXml;
+
+            var isAzure = _serverConnection!.ServerName.Contains(".database.windows.net",
+                              StringComparison.OrdinalIgnoreCase) ||
+                          _serverConnection.ServerName.Contains(".database.azure.com",
+                              StringComparison.OrdinalIgnoreCase);
+
+            if (estimated)
+            {
+                planXml = await EstimatedPlanExecutor.GetEstimatedPlanAsync(
+                    _connectionString, _selectedDatabase, queryText, timeoutSeconds: 0, ct);
+            }
+            else
+            {
+                planXml = await ActualPlanExecutor.ExecuteForActualPlanAsync(
+                    _connectionString, _selectedDatabase, queryText,
+                    planXml: null, isolationLevel: null,
+                    isAzureSqlDb: isAzure, timeoutSeconds: 0, ct);
+            }
+
+            sw.Stop();
+
+            /* The result can arrive after the run was cancelled: the tab was closed, or the next
+               query superseded this one, while the answer was already on its way back. Showing it
+               would put a plan viewer into a tab that is no longer in the strip, and it would stay
+               registered with the MCP session manager with nothing left to close it. */
+            ct.ThrowIfCancellationRequested();
+
+            if (string.IsNullOrEmpty(planXml))
+            {
+                progress.ShowOutcome($"No plan returned ({sw.Elapsed.TotalSeconds:F1}s)");
+                return;
+            }
+
+            // Replace loading content with the plan viewer
+            SetStatus($"{planType} plan captured ({sw.Elapsed.TotalSeconds:F1}s)");
+            ShowCapturedPlan(loadingTab, planXml, tabLabel, queryText);
+        }
+        catch (Exception ex) when (CancellationHelper.IsCancellation(ex, ct))
+        {
+            /* Nothing in the strip. The user cancelled this themselves — Escape, the Cancel
+               button, or by starting the next query — and the spinner tab vanishing is the
+               answer to that. Saying so as well used to be harmless and is no longer even
+               visible: removing the selected tab clears the selection, and a selection change
+               empties the strip. (It used to MOVE the selection to a neighbour. A deselectable
+               strip clears it instead and RemoveDocument picks the neighbour afterwards — a
+               different mechanism, and the same thing this relies on either way.)
+
+               The token decides, not the exception type. A cancel that lands while the query is
+               running comes back from SqlClient as a SqlException ("Operation cancelled by
+               user."), not an OperationCanceledException, so it used to fall through to the
+               failure below and leave the cancelled run on screen as a red error (#625). */
+            RemoveDocument(loadingTab);
+        }
+        catch (Exception ex)
+        {
+            progress.ShowFailure(ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Puts a captured plan into the tab that has been showing the progress spinner for it.
+    ///
+    /// <para>Both execution paths end here — the estimated/actual capture and Get Actual Plan — and
+    /// this is the moment a plan appears in a session, so it is the moment Compare Plans has to be
+    /// re-decided. That happens through the sub-tab
+    /// <see cref="Helpers.TabContentWatcher"/> rather than a call added below, because the assignment
+    /// on the last line is what it is watching for (#447).</para>
+    ///
+    /// <para>Internal so a test can drive the plan landing with XML it already has, rather than
+    /// needing a SQL Server to produce some. The half of these paths that reaches out to a server
+    /// is above this; everything that decides what the user ends up looking at is here.</para>
+    /// </summary>
+    internal void ShowCapturedPlan(TabItem planTab, string planXml, string tabLabel, string queryText,
+        string? sourceDatabase = null)
+    {
+        var viewer = new PlanViewerControl();
+        // Sub-tab of this session: the session's toolbar above it owns the connection (#U5).
+        viewer.HostedInSession = true;
+        viewer.Metadata = _serverMetadata;
+        ConnectViewer(viewer, sourceDatabase);
+        viewer.OpenInEditorRequested += OnOpenInEditorRequested;
+        viewer.LoadPlan(planXml, tabLabel, queryText);
+        planTab.Content = viewer;
+
+        /* The content swap above changes no selection, so SelectionChanged never fires and the
+           button row never hears that a plan arrived: Copy Repro and Run Repro stayed dead after
+           every execute until the user clicked away and back. This call is the ONLY correct
+           answer — manual IsEnabled writes at the call sites used to paper over half of it, and
+           because they ran unconditionally AFTER this refresh they re-lit Advice on a view
+           surface, where pressing it opened advice for a document the user was not looking at.
+           On a view the refresh reads a null SelectedDocument and keeps everything disabled;
+           that is the Q2 gate and nothing may write these buttons around it. */
+        UpdatePlanTabButtonState();
+    }
+
+    /// <summary>
+    /// Resolves which database and connection string Get Actual Plan should run
+    /// <paramref name="viewer"/>'s query against: the viewer's own <see
+    /// cref="PlanViewerControl.SourceDatabase"/> when it has one — a plan pulled from a Query
+    /// Store grid's own database picker, which can differ from the toolbar's (E1) — or the
+    /// toolbar's <c>_selectedDatabase</c>/<c>_connectionString</c> when it does not, which is
+    /// every other plan tab (executed, pasted, or opened from History).
+    ///
+    /// <para>Internal so a test can pin the choice directly — through <see
+    /// cref="PlanViewerControl.SourceDatabase"/> and this method — rather than by executing a
+    /// query to observe which database it landed in.</para>
+    /// </summary>
+    internal (string? Database, string? ConnectionString) ResolveExecutionTarget(PlanViewerControl viewer)
+    {
+        if (viewer.SourceDatabase != null)
+            return (viewer.SourceDatabase,
+                _serverConnection?.GetConnectionString(_credentialService, viewer.SourceDatabase));
+
+        return (_selectedDatabase, _connectionString);
+    }
+
+    private async void GetActualPlan_Click(object? sender, RoutedEventArgs e)
+    {
+        var viewer = GetSelectedPlanViewer();
+        if (viewer == null)
+        {
+            SetErrorStatus("Select a plan tab first");
+            return;
+        }
+
+        if (_connectionString == null || _selectedDatabase == null)
+        {
+            SetErrorStatus("Connect to a server first");
+            return;
+        }
+
+        var queryText = viewer.QueryText ?? "";
+        var planXml = viewer.RawXml;
+
+        if (string.IsNullOrEmpty(queryText))
+        {
+            SetErrorStatus("No query text available for this plan");
+            return;
+        }
+
+        var (database, connectionString) = ResolveExecutionTarget(viewer);
+        if (connectionString == null)
+        {
+            SetErrorStatus("Connect to a server first");
+            return;
+        }
+
+        /* Show confirmation dialog */
+        var confirmed = await ShowConfirmationDialog(
+            "Get Actual Plan",
+            $"The query will execute in [{database}] with SET STATISTICS XML ON to capture the actual plan.\n\nAll data results will be discarded.\n\nContinue?");
+
+        if (!confirmed) return;
+
+        var runCts = BeginRun();
+        var ct = runCts.Token;
+
+        // Create loading tab with cancel button
+        var progress = new Helpers.CaptureProgressPanel(this, "Capturing actual plan...", runCts);
+
+        _planCounter++;
+        var tabLabel = $"Plan {_planCounter}";
+        var loadingTab = NewPlanTab(tabLabel, progress.Root);
+        _tabRuns.AddOrUpdate(loadingTab, runCts);
+
+        AddDocument(loadingTab);
+        SelectDocument(loadingTab);
+        progress.Root.Focus();
+
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            var isAzure = IsAzureConnection;
+
+            var actualPlanXml = await ActualPlanExecutor.ExecuteForActualPlanAsync(
+                connectionString, database, queryText,
+                planXml, isolationLevel: null,
+                isAzureSqlDb: isAzure, timeoutSeconds: 0, ct);
+
+            sw.Stop();
+
+            // Same as the capture path above: a cancelled run does not put its plan on screen.
+            ct.ThrowIfCancellationRequested();
+
+            if (string.IsNullOrEmpty(actualPlanXml))
+            {
+                progress.ShowOutcome($"No actual plan returned ({sw.Elapsed.TotalSeconds:F1}s)");
+                return;
+            }
+
+            SetStatus($"Actual plan captured ({sw.Elapsed.TotalSeconds:F1}s)");
+
+            // Carry the source database forward, so a second Get Actual Plan on THIS tab (the
+            // one just captured) still runs where the first one did rather than reverting to
+            // the toolbar's (E1). Null for a toolbar-sourced plan, same as its own viewer.
+            ShowCapturedPlan(loadingTab, actualPlanXml, tabLabel, queryText, viewer.SourceDatabase);
+        }
+        catch (Exception ex) when (CancellationHelper.IsCancellation(ex, ct))
+        {
+            // Same as the capture path above: the cancel was the user's own, and the tab going
+            // away says so. See that catch for why the message is gone, and why the token
+            // decides rather than the exception type.
+            RemoveDocument(loadingTab);
+        }
+        catch (Exception ex)
+        {
+            progress.ShowFailure(ex.Message);
+        }
+        finally
+        {
+            UpdatePlanTabButtonState();
+        }
+    }
+
+    /// <summary>
+    /// Shows a modal confirmation dialog and returns true if the user confirmed.
+    /// </summary>
+    private Task<bool> ShowConfirmationDialog(string title, string message, string confirmCaption = "OK")
+        => Dialogs.ConfirmationDialog.ShowAsync(GetParentWindow(), title, message, confirmCaption);
+
+    /// <summary>
+    /// Extracts the database name from plan XML's StmtSimple DatabaseContext attribute.
+    /// Returns null if not found.
+    /// </summary>
+    private static string? ExtractDatabaseFromPlanXml(string? planXml)
+    {
+        if (string.IsNullOrEmpty(planXml)) return null;
+
+        try
+        {
+            var doc = PlanXml.Parse(planXml);
+            XNamespace ns = "http://schemas.microsoft.com/sqlserver/2004/07/showplan";
+
+            /* Try StmtSimple first — most queries have this */
+            var stmt = doc.Descendants(ns + "StmtSimple").FirstOrDefault();
+            var dbContext = stmt?.Attribute("DatabaseContext")?.Value;
+
+            if (!string.IsNullOrEmpty(dbContext))
+            {
+                /* DatabaseContext is typically "[dbname]" — strip brackets */
+                return dbContext.Trim('[', ']');
+            }
+        }
+        catch
+        {
+            /* XML parse failure — fall through to null */
+        }
+
+        return null;
+    }
+
+    private Window GetParentWindow()
+    {
+        /* GetTopLevel rather than VisualRoot because Avalonia 12 hosts a Window inside a
+           TopLevelHost, so the visual root is no longer the Window and casting it to one always
+           misses — silently, since VisualRoot still compiles and still returns something. */
+        var parent = TopLevel.GetTopLevel(this);
+        return parent as Window ?? throw new InvalidOperationException("No parent window");
+    }
+}

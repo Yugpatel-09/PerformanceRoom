@@ -1,0 +1,628 @@
+@page "/"
+@inject IJSRuntime JS
+@inject IPlanShareService ShareService
+
+@if (result == null)
+{
+    <div class="landing">
+        <div class="landing-content">
+            <h2>Free SQL Server Query Plan Analysis</h2>
+            <p class="privacy">Paste or upload a .sqlplan file. Your plan XML never leaves your browser.</p>
+            <p class="powered-by">Powered by the same analysis engine in the <a href="https://github.com/Yugpatel-09/PerformanceRoom" target="_blank" rel="noopener">Performance Room</a> app. <span class="app-version">@AppVersion</span></p>
+
+            @if (errorMessage != null)
+            {
+                <div class="error-message">@errorMessage</div>
+            }
+
+            <div class="input-area">
+                <div class="input-tabs">
+                    <button class="tab @(activeTab == "paste" ? "active" : "")" @onclick='() => activeTab = "paste"'>Paste XML</button>
+                    <button class="tab @(activeTab == "upload" ? "active" : "")" @onclick='() => activeTab = "upload"'>Upload File</button>
+                </div>
+
+                @if (activeTab == "paste")
+                {
+                    <textarea @bind="planXml" placeholder="Paste .sqlplan XML here..." rows="14"></textarea>
+                    <button class="analyze-btn" @onclick="AnalyzePasted" disabled="@isAnalyzing">
+                        @(isAnalyzing ? "Analyzing..." : "Analyze")
+                    </button>
+                }
+                else
+                {
+                    <div class="upload-area">
+                        <InputFile OnChange="OnFileSelected" accept=".sqlplan,.xml" />
+                        <p class="upload-hint">Accepts .sqlplan and .xml files up to 10 MB</p>
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+}
+else
+{
+    @if (errorMessage != null)
+    {
+        <div class="error-message">@errorMessage</div>
+    }
+
+    <div class="toolbar">
+        <button class="back-btn" @onclick="Reset">New Plan</button>
+        <button class="back-btn" @onclick="ExportHtml">Export HTML</button>
+        <button class="share-btn" @onclick="ShowShareDialog" disabled="@isSharing">Share</button>
+        <span class="toolbar-source">@sourceLabel</span>
+        <span class="toolbar-plan-type @(result.Summary.HasActualStats ? "actual" : "estimated")">
+            @(result.Summary.HasActualStats ? "Actual Plan" : "Estimated Plan")
+        </span>
+        @if (result.SqlServerBuild != null)
+        {
+            <span class="toolbar-version">@result.SqlServerBuild</span>
+        }
+        <span class="toolbar-app-version" title="Performance Room web viewer version">@AppVersion</span>
+        @if (shareUrl != null)
+        {
+            <span class="share-url"><a href="@shareUrl" target="_blank">@shareUrl</a></span>
+        }
+        @if (deleteToken != null)
+        {
+            <button class="delete-share-btn" @onclick="DeleteSharedPlan" disabled="@isDeleting">
+                @(isDeleting ? "Deleting..." : "Delete Share")
+            </button>
+        }
+    </div>
+
+    @if (sharePhase == 1)
+    {
+        <div class="modal-overlay" @onclick="HideShareDialog">
+            <div class="modal" @onclick:stopPropagation="true">
+                <h3>Share Plan Analysis</h3>
+                <p>Your plan analysis will be uploaded and stored on a server. Anyone with the link can read all of it. The upload includes:</p>
+                <ul>
+                    <li>The file name of the plan</li>
+                    <li>The query text</li>
+                    <li>The operator details and the warnings</li>
+                    <li>The compiled and runtime values of the parameters</li>
+                    <li>The missing index suggestions, with database, schema, and table names</li>
+                    <li>The full text report</li>
+                </ul>
+                <p>Query text and parameter values can contain private data. Check the analysis on this page before you share it.</p>
+                <div class="ttl-picker">
+                    <label>Expire after:</label>
+                    <select @bind="shareTtlDays">
+                        <option value="1">1 day</option>
+                        <option value="7">7 days</option>
+                        <option value="30">30 days</option>
+                        <option value="90">90 days</option>
+                        <option value="180">6 months</option>
+                        <option value="365">1 year</option>
+                    </select>
+                </div>
+                <div class="modal-actions">
+                    <button class="back-btn" @onclick="HideShareDialog">Cancel</button>
+                    <button class="analyze-btn" @onclick="AdvanceSharePhase">Continue</button>
+                </div>
+            </div>
+        </div>
+    }
+
+    @if (sharePhase == 2)
+    {
+        <div class="modal-overlay" @onclick="HideShareDialog">
+            <div class="modal" @onclick:stopPropagation="true">
+                <h3>Confirm Share</h3>
+                <p>You are about to share your plan analysis publicly for <strong>@FormatTtl(shareTtlDays)</strong>.</p>
+                <p>This cannot be undone after you leave this page. Are you sure?</p>
+                <div class="modal-actions">
+                    <button class="back-btn" @onclick="() => sharePhase = 1">Back</button>
+                    <button class="analyze-btn" @onclick="SharePlan" disabled="@isSharing">
+                        @(isSharing ? "Sharing..." : "Yes, Share")
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+
+    @* Statement selector for multi-statement plans *@
+    @if (result.Statements.Count > 1)
+    {
+        <div class="statement-tabs">
+            @foreach (var entry in SortedStatementIndexes)
+            {
+                var idx = entry;
+                var isActive = idx == activeStatement;
+                var s = result.Statements[idx];
+                <button class="stmt-tab @(isActive ? "active" : "")" @onclick="() => SelectStatement(idx)">
+                    Statement @(idx + 1)
+                    @if (s.QueryTime != null)
+                    {
+                        <span class="stmt-tab-time">@FormatMs(s.QueryTime.ElapsedTimeMs)</span>
+                    }
+                    else
+                    {
+                        <span class="stmt-tab-cost">@s.EstimatedCost.ToString("N2")</span>
+                    }
+                    @if (GetAllWarnings(s).Count > 0)
+                    {
+                        <span class="stmt-tab-warns">@GetAllWarnings(s).Count</span>
+                    }
+                </button>
+            }
+        </div>
+    }
+
+    @* Insights panel *@
+    <InsightsPanel Stmt="ActiveStmt!" HasActualStats="result.Summary.HasActualStats" />
+
+    @* Warnings strip *@
+    @if (GetAllWarnings(ActiveStmt!).Count > 0)
+    {
+        <WarningsStrip Stmt="ActiveStmt!" />
+    }
+
+    @* Statement text *@
+    <details class="stmt-text-section">
+        <summary>Query Text</summary>
+        <pre class="statement-text">@ActiveStmt!.StatementText</pre>
+    </details>
+
+    @* Plan tree *@
+    @if (ActiveStmtPlan?.RootNode != null)
+    {
+        var extents = PlanLayoutEngine.GetExtents(ActiveStmtPlan!.RootNode);
+        <div class="plan-tree-container">
+            <div class="plan-tree" style="width: @(extents.width)px; height: @(extents.height)px; position: relative;">
+                <svg class="plan-connectors" style="width: @(extents.width)px; height: @(extents.height)px;">
+                    @RenderConnectors(ActiveStmtPlan!.RootNode)
+                </svg>
+                @RenderPlanNodes(ActiveStmtPlan!.RootNode, true)
+            </div>
+        </div>
+    }
+
+    @* Full text output *@
+    <details class="text-output">
+        <summary>Full Text Analysis</summary>
+        <pre>@textOutput</pre>
+    </details>
+
+    @* === Operator Properties Panel === *@
+    @if (selectedNode != null)
+    {
+        <OperatorPropertiesPanel Node="selectedNode"
+                                 StmtPlan="ActiveStmtPlan"
+                                 Plan="parsedPlan"
+                                 IsRoot="IsRootNode"
+                                 OnClose="CloseProperties" />
+    }
+}
+
+@code {
+    private static readonly string AppVersion = GetAppVersion();
+    private static string GetAppVersion()
+    {
+        var v = typeof(Index).Assembly.GetName().Version;
+        return v == null ? "?" : $"v{v.Major}.{v.Minor}.{v.Build}";
+    }
+
+    private string activeTab = "paste";
+    private string planXml = "";
+    private string? errorMessage;
+    private bool isAnalyzing;
+    private AnalysisResult? result;
+    private ParsedPlan? parsedPlan;
+    private string? textOutput;
+    private string? sourceLabel;
+    private int activeStatement = 0;
+    private int sharePhase; // 0=hidden, 1=consent, 2=confirm
+    private bool isSharing;
+    private bool isDeleting;
+    private string? shareUrl;
+    private string? shareId;
+    private string? deleteToken;
+    private int shareTtlDays = 7;
+    private PlanNode? selectedNode;
+
+    private StatementResult? ActiveStmt => result?.Statements.ElementAtOrDefault(activeStatement);
+    /* activeStatement indexes result.Statements, which ResultMapper builds from
+       PlanStatements.EnumerateAll — since #456 that includes statements inside stored procedure
+       and UDF bodies. Mapping the same index into the outer-only batch list returned null for
+       every body statement, so clicking a body statement's tab showed its analysis with no
+       operator tree. The two lists must be walked by the same traversal to line up. */
+    private PlanStatement? ActiveStmtPlan => parsedPlan == null
+        ? null
+        : PlanStatements.EnumerateAll(parsedPlan).ElementAtOrDefault(activeStatement);
+
+    private async Task AnalyzePasted()
+    {
+        if (string.IsNullOrWhiteSpace(planXml))
+        {
+            errorMessage = "Paste plan XML first.";
+            return;
+        }
+
+        await RunAnalysis(planXml, "pasted plan");
+    }
+
+    private async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file.Size > 10 * 1024 * 1024)
+        {
+            errorMessage = $"File too large ({file.Size / (1024 * 1024)} MB). Maximum is 10 MB.";
+            return;
+        }
+
+        try
+        {
+            using var stream = file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024);
+            using var reader = new StreamReader(stream, detectEncodingFromByteOrderMarks: true);
+            var xml = await reader.ReadToEndAsync();
+            await RunAnalysis(xml, file.Name);
+        }
+        catch (Exception ex)
+        {
+            errorMessage = $"Failed to read file: {ex.Message}";
+        }
+    }
+
+    private async Task RunAnalysis(string xml, string source)
+    {
+        errorMessage = null;
+        isAnalyzing = true;
+        activeStatement = 0;
+        StateHasChanged();
+        await Task.Yield();
+
+        try
+        {
+            xml = xml.Replace("encoding=\"utf-16\"", "encoding=\"utf-8\"");
+
+            parsedPlan = ShowPlanParser.Parse(xml);
+
+            if (parsedPlan.ParseError != null)
+            {
+                errorMessage = $"Parse error: {parsedPlan.ParseError}";
+                isAnalyzing = false;
+                return;
+            }
+
+            /* XML that parses but is not a showplan, or a showplan with no statements, gets this far
+               with nothing to show. The result view draws the active statement without checking that
+               there is one, so let it through and the page threw a NullReferenceException. */
+            if (PlanStatements.NoStatementsMessage(parsedPlan) is { } noStatements)
+            {
+                errorMessage = noStatements;
+                parsedPlan = null;
+                return;
+            }
+
+            PlanAnalyzer.Analyze(parsedPlan);
+            BenefitScorer.Score(parsedPlan);
+
+            foreach (var batch in parsedPlan.Batches)
+            {
+                foreach (var stmt in batch.Statements)
+                {
+                    PlanLayoutEngine.Layout(stmt);
+                }
+            }
+
+            result = ResultMapper.Map(parsedPlan, source);
+            textOutput = TextFormatter.Format(result);
+            sourceLabel = source;
+        }
+        catch (System.Xml.XmlException ex)
+        {
+            errorMessage = $"Invalid XML: {ex.Message}";
+        }
+        catch (Exception ex)
+        {
+            errorMessage = $"Analysis failed: {ex.Message}";
+        }
+        finally
+        {
+            isAnalyzing = false;
+        }
+    }
+
+    private void Reset()
+    {
+        result = null;
+        parsedPlan = null;
+        textOutput = null;
+        errorMessage = null;
+        planXml = "";
+        activeStatement = 0;
+        selectedNode = null;
+        shareUrl = null;
+        shareId = null;
+        deleteToken = null;
+        sharePhase = 0;
+    }
+
+    private async Task ExportHtml()
+    {
+        if (result == null || textOutput == null) return;
+        var html = HtmlExporter.Export(result, textOutput);
+        var fileName = (sourceLabel ?? "plan") + ".html";
+        if (fileName.EndsWith(".sqlplan.html", StringComparison.OrdinalIgnoreCase))
+            fileName = fileName[..^".sqlplan.html".Length] + ".html";
+        await JS.InvokeVoidAsync("downloadFile", fileName, html);
+    }
+
+    private void ShowShareDialog()
+    {
+        sharePhase = 1;
+        shareTtlDays = 7;
+    }
+
+    private void HideShareDialog() => sharePhase = 0;
+    private void AdvanceSharePhase() => sharePhase = 2;
+
+    private async Task SharePlan()
+    {
+        if (result == null || textOutput == null) return;
+        isSharing = true;
+        sharePhase = 0;
+        errorMessage = null;
+        StateHasChanged();
+
+        try
+        {
+            var share = await ShareService.ShareAsync(result, textOutput, shareTtlDays);
+            shareId = share.Id;
+            deleteToken = share.DeleteToken;
+            var baseUrl = await JS.InvokeAsync<string>("getBaseUrl");
+            shareUrl = $"{baseUrl}?share={shareId}";
+            await JS.InvokeVoidAsync("copyToClipboard", shareUrl);
+        }
+        catch (Exception ex)
+        {
+            errorMessage = ex is PlanShareException ? ex.Message : $"Share failed: {ex.Message}";
+        }
+        finally
+        {
+            isSharing = false;
+        }
+    }
+
+    private async Task DeleteSharedPlan()
+    {
+        if (shareId == null || deleteToken == null) return;
+        isDeleting = true;
+        StateHasChanged();
+
+        try
+        {
+            await ShareService.DeleteAsync(shareId, deleteToken);
+            shareUrl = null;
+            shareId = null;
+            deleteToken = null;
+            errorMessage = null;
+        }
+        catch (Exception ex)
+        {
+            errorMessage = ex is PlanShareException ? ex.Message : $"Delete failed: {ex.Message}";
+        }
+        finally
+        {
+            isDeleting = false;
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        var uri = await JS.InvokeAsync<string>("getQueryParam", "share");
+        if (!string.IsNullOrEmpty(uri))
+        {
+            await LoadSharedPlan(uri);
+        }
+    }
+
+    private async Task LoadSharedPlan(string id)
+    {
+        isAnalyzing = true;
+        StateHasChanged();
+
+        try
+        {
+            var shared = await ShareService.LoadAsync(id);
+
+            // The same guard as RunAnalysis: a stored result with no statements would fail the same way.
+            if (shared.Result is { } loaded && PlanStatements.NoStatementsMessage(loaded) is { } noStatements)
+            {
+                errorMessage = noStatements;
+                return;
+            }
+
+            result = shared.Result;
+            textOutput = shared.Text;
+            sourceLabel = "shared plan";
+        }
+        catch (Exception ex)
+        {
+            errorMessage = ex is PlanShareException ? ex.Message : $"Failed to load shared plan: {ex.Message}";
+        }
+        finally
+        {
+            isAnalyzing = false;
+        }
+    }
+
+    private RenderFragment RenderPlanNodes(PlanNode node, bool isRoot) => builder =>
+    {
+        var height = PlanLayoutEngine.GetNodeHeight(node);
+        var costClass = node.CostPercent >= 25 ? " expensive" : "";
+        var warningClass = node.HasWarnings ? " has-warnings" : "";
+        var parallelClass = node.Parallel ? " parallel" : "";
+
+        builder.OpenElement(0, "div");
+        var selectedClass = node == selectedNode ? " selected" : "";
+        builder.AddAttribute(1, "class", $"plan-node{costClass}{warningClass}{parallelClass}{selectedClass}");
+        builder.AddAttribute(2, "style",
+            $"left: {node.X}px; top: {node.Y}px; width: {PlanLayoutEngine.NodeWidth}px; height: {height}px;");
+
+        var tooltip = BuildTooltip(node);
+        builder.AddAttribute(3, "title", tooltip);
+        builder.AddAttribute(50, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this, () => SelectNode(node)));
+
+        // Icon row
+        builder.OpenElement(4, "div");
+        builder.AddAttribute(5, "class", "node-icon-row");
+
+        builder.OpenElement(6, "img");
+        builder.AddAttribute(7, "src", $"icons/{node.IconName}.png");
+        builder.AddAttribute(8, "class", "node-icon");
+        builder.AddAttribute(9, "alt", node.PhysicalOp);
+        builder.CloseElement();
+
+        if (node.HasWarnings)
+        {
+            builder.OpenElement(10, "span");
+            builder.AddAttribute(11, "class", "badge-warn");
+            builder.AddContent(12, "\u26a0");
+            builder.CloseElement();
+        }
+        if (node.Parallel)
+        {
+            builder.OpenElement(13, "span");
+            builder.AddAttribute(14, "class", "badge-parallel");
+            builder.AddContent(15, "\u21c6");
+            builder.CloseElement();
+        }
+
+        builder.CloseElement(); // node-icon-row
+
+        // Operator name
+        var opLabel = node.PhysicalOp;
+        if (node.PhysicalOp == "Parallelism" && !string.IsNullOrEmpty(node.LogicalOp)
+            && node.LogicalOp != "Parallelism")
+        {
+            opLabel = $"Parallelism ({node.LogicalOp})";
+        }
+
+        builder.OpenElement(16, "div");
+        builder.AddAttribute(17, "class", "node-op");
+        builder.AddContent(18, opLabel);
+        builder.CloseElement();
+
+        // Cost %
+        var costColorClass = !node.HasActualStats && node.CostPercent >= 50 ? " cost-high"
+            : !node.HasActualStats && node.CostPercent >= 25 ? " cost-med"
+            : "";
+        builder.OpenElement(19, "div");
+        builder.AddAttribute(20, "class", $"node-cost{costColorClass}");
+        builder.AddContent(21, $"Cost: {node.CostPercent}%");
+        builder.CloseElement();
+
+        // Actual plan stats
+        if (node.HasActualStats)
+        {
+            var ownElapsedMs = NodeTimeAttribution.GetOwnElapsedMs(node);
+            var ownCpuMs = NodeTimeAttribution.GetOwnCpuMs(node);
+            var ownElapsedSec = ownElapsedMs / 1000.0;
+            var ownCpuSec = ownCpuMs / 1000.0;
+
+            var elClass = ownElapsedSec >= 1.0 ? " time-high" : ownElapsedSec >= 0.1 ? " time-med" : "";
+            builder.OpenElement(22, "div");
+            builder.AddAttribute(23, "class", $"node-time{elClass}");
+            builder.AddContent(24, $"{ownElapsedSec:F3}s");
+            builder.CloseElement();
+
+            var cpuClass = ownCpuSec >= 1.0 ? " time-high" : ownCpuSec >= 0.1 ? " time-med" : "";
+            builder.OpenElement(25, "div");
+            builder.AddAttribute(26, "class", $"node-cpu{cpuClass}");
+            builder.AddContent(27, $"CPU: {ownCpuSec:F3}s");
+            builder.CloseElement();
+
+            // #594: EstimateRows is per execution — RowEstimateHelper scales it by
+            // ActualExecutions only on the inner side of a Nested Loops join, where that count is
+            // real rather than a parallel zone's thread count.
+            // #611: PlanRowAccuracy adds decimals where N0 would print numbers that contradict
+            // the percentage ("1 of 1 (89%)").
+            var ratio = RowEstimateHelper.GetRowAccuracyRatio(node);
+            var rowClass = (ratio < 0.1 || ratio > 10.0) ? " rows-skewed" : "";
+            builder.OpenElement(28, "div");
+            builder.AddAttribute(29, "class", $"node-rows{rowClass}");
+            builder.AddContent(30, PlanRowAccuracy.FormatActualOfExpected(node.ActualRows, RowEstimateHelper.GetExpectedRows(node)));
+            builder.CloseElement();
+        }
+        else
+        {
+            builder.OpenElement(31, "div");
+            builder.AddAttribute(32, "class", "node-rows");
+            builder.AddContent(33, $"{node.EstimateRows:N0} est. rows");
+            builder.CloseElement();
+        }
+
+        if (!string.IsNullOrEmpty(node.ObjectName))
+        {
+            builder.OpenElement(34, "div");
+            builder.AddAttribute(35, "class", "node-object");
+            builder.AddContent(36, node.FullObjectName ?? node.ObjectName);
+            builder.CloseElement();
+        }
+
+        builder.CloseElement(); // plan-node
+
+        foreach (var child in node.Children)
+            builder.AddContent(37, RenderPlanNodes(child, false));
+    };
+
+    private RenderFragment RenderConnectors(PlanNode node) => builder =>
+    {
+        foreach (var child in node.Children)
+        {
+            var rows = child.HasActualStats ? child.ActualRows : (long)child.EstimateRows;
+            var thickness = rows > 100000 ? 4.0 : rows > 10000 ? 2.5 : 1.5;
+
+            var x1 = node.X + PlanLayoutEngine.NodeWidth;
+            var y1 = node.Y + PlanLayoutEngine.GetNodeHeight(node) / 2;
+            var x2 = child.X;
+            var y2 = child.Y + PlanLayoutEngine.GetNodeHeight(child) / 2;
+
+            builder.OpenElement(0, "line");
+            builder.AddAttribute(1, "x1", x1.ToString("F1"));
+            builder.AddAttribute(2, "y1", y1.ToString("F1"));
+            builder.AddAttribute(3, "x2", x2.ToString("F1"));
+            builder.AddAttribute(4, "y2", y2.ToString("F1"));
+            builder.AddAttribute(5, "class", "connector");
+            builder.AddAttribute(6, "style", $"stroke-width: {thickness:F1}");
+            builder.CloseElement();
+
+            builder.AddContent(7, RenderConnectors(child));
+        }
+    };
+
+    private void SelectNode(PlanNode node)
+    {
+        selectedNode = selectedNode == node ? null : node;
+    }
+
+    private void CloseProperties()
+    {
+        selectedNode = null;
+    }
+
+    private void SelectStatement(int idx)
+    {
+        activeStatement = idx;
+        selectedNode = null;
+    }
+
+    private bool IsRootNode => selectedNode != null && ActiveStmtPlan?.RootNode == selectedNode;
+
+    // Sort statement tabs: actual plans by elapsed time (desc), estimated by cost (desc)
+    private IEnumerable<int> SortedStatementIndexes
+    {
+        get
+        {
+            if (result == null) return Enumerable.Empty<int>();
+            var indexes = Enumerable.Range(0, result.Statements.Count);
+            if (result.Summary.HasActualStats)
+                return indexes.OrderByDescending(i => result.Statements[i].QueryTime?.ElapsedTimeMs ?? 0);
+            return indexes.OrderByDescending(i => result.Statements[i].EstimatedCost);
+        }
+    }
+
+}

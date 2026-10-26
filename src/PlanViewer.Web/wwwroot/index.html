@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Free SQL Server Query Plan Analysis — Yug Patel</title>
+    <meta name="description" content="Free browser-based SQL Server execution plan analysis. Paste or upload a .sqlplan file — your plan XML never leaves your browser." />
+    <meta property="og:title" content="Free SQL Server Query Plan Analysis" />
+    <meta property="og:description" content="Analyze SQL Server execution plans instantly in your browser. Paste or upload a .sqlplan file — nothing to install, no data sent to a server." />
+    <meta property="og:image" content="https://plans.erikdarling.com/darling-data-logo.jpg" />
+    <meta property="og:url" content="https://plans.erikdarling.com" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Free SQL Server Query Plan Analysis" />
+    <meta name="twitter:description" content="Analyze SQL Server execution plans instantly in your browser. Paste or upload a .sqlplan file — nothing to install, no data sent to a server." />
+    <meta name="twitter:image" content="https://plans.erikdarling.com/darling-data-logo.jpg" />
+    <link rel="icon" type="image/png" href="favicon.png" />
+    <base href="/" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link href="css/app.css" rel="stylesheet" />
+</head>
+<body>
+    <div id="app">
+        <div class="loading">Loading analysis engine...</div>
+    </div>
+
+    <div id="blazor-error-ui">
+        An unhandled error has occurred.
+        <a href="" class="reload">Reload</a>
+    </div>
+
+    <script src="_framework/blazor.webassembly.js"></script>
+    <script>
+        // Lightweight analytics — pings PlanShare server, no cookies, no PII
+        (function() {
+            var r = document.referrer || '';
+            // Skip self-referrals
+            if (r && new URL(r).host === location.host) r = '';
+            fetch('https://stats.erikdarling.com/api/event', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: location.pathname + location.search, referrer: r}),
+                keepalive: true
+            }).catch(function(){});
+        })();
+    </script>
+    <script>
+        function downloadFile(fileName, content) {
+            const blob = new Blob([content], { type: 'text/html;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        function getBaseUrl() {
+            return window.location.origin + window.location.pathname;
+        }
+        function getQueryParam(name) {
+            return new URLSearchParams(window.location.search).get(name) || '';
+        }
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).catch(() => {});
+        }
+    </script>
+</body>
+</html>

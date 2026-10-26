@@ -1,0 +1,556 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Input.Platform;
+using Avalonia.Interactivity;
+using Avalonia.Layout;
+using Avalonia.Media;
+using Avalonia.Platform.Storage;
+using Avalonia.Threading;
+using PlanViewer.App.Controls;
+using PlanViewer.App.Helpers;
+using PlanViewer.App.Mcp;
+using PlanViewer.App.Services;
+using PlanViewer.Core.Interfaces;
+using PlanViewer.Core.Models;
+using PlanViewer.Core.Output;
+using PlanViewer.Core.Services;
+
+namespace PlanViewer.App;
+
+public partial class MainWindow : Window
+{
+    /// <summary>
+    /// Wraps a loaded plan in the toolbar a window-level plan tab shows above it.
+    ///
+    /// <para>Internal so a test can reproduce what Get Actual Plan does to a file tab — build this
+    /// and assign it over a tab that was holding a spinner — without executing anything (#447).</para>
+    /// </summary>
+    internal DockPanel CreatePlanTabContent(PlanViewerControl viewer)
+    {
+        var humanBtn = new Button
+        {
+            Content = AppIcons.MakeContent(AppIcons.HumanAdvice, "Human Advice"),
+            Height = 28,
+            Padding = new Avalonia.Thickness(10, 0),
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(0, 0, 6, 0),
+            VerticalContentAlignment = VerticalAlignment.Center,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+
+        var robotBtn = new Button
+        {
+            Content = AppIcons.MakeContent(AppIcons.RobotAdvice, "Robot Advice"),
+            Height = 28,
+            Padding = new Avalonia.Thickness(10, 0),
+            FontSize = 12,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+
+        Action showHumanAdvice = () =>
+        {
+            if (viewer.CurrentPlan == null) return;
+            var analysis = ResultMapper.Map(viewer.CurrentPlan, "file", viewer.Metadata, viewer.QueryText);
+            ShowAdviceWindow("Advice for Humans", TextFormatter.Format(analysis), analysis, viewer);
+        };
+
+        Action showRobotAdvice = () =>
+        {
+            if (viewer.CurrentPlan == null) return;
+            var analysis = ResultMapper.Map(viewer.CurrentPlan, "file", viewer.Metadata, viewer.QueryText);
+            string json;
+            try
+            {
+                json = JsonSerializer.Serialize(analysis, AnalysisJson.Indented);
+            }
+            catch (Exception ex) when (ex is JsonException or NotSupportedException)
+            {
+                /* #430: the same unguarded-click-handler crash as QuerySessionControl's Robot Advice
+                   button — this entry point builds the payload independently, so it needed the same
+                   depth ceiling and the same guard. */
+                ShowError(ex is JsonException
+                    ? $"Could not build robot advice for this plan. {AnalysisJson.TooDeepMessage}"
+                    : $"Could not build robot advice for this plan: {ex.Message}");
+                return;
+            }
+
+            ShowAdviceWindow("Advice for Robots", json);
+        };
+
+        humanBtn.Click += (_, _) => showHumanAdvice();
+        robotBtn.Click += (_, _) => showRobotAdvice();
+
+        var compareBtn = new Button
+        {
+            /* Named so RefreshComparePlanAvailability can find it again. This toolbar is built
+               fresh for every plan tab and for every detached plan window, so there is no field
+               to hold them in, and whether Compare is available is a fact about the whole
+               window that changes long after the button was made. */
+            Name = Helpers.ComparePlansButtonState.Name,
+            Content = AppIcons.MakeContent(AppIcons.Compare, "Compare Plans"),
+            Height = 28,
+            Padding = new Avalonia.Thickness(10, 0),
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(6, 0, 0, 0),
+            VerticalContentAlignment = VerticalAlignment.Center,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+
+        /* Born with the honest answer rather than enabled: this toolbar is often built by the
+           very call that makes the second plan exist (LoadPlanFile assigns the tab's content
+           after this returns), so the watcher's refresh may have already run for a window that
+           did not yet contain this plan. */
+        Helpers.ComparePlansButtonState.Apply(compareBtn, CollectAllPlanTabs().Count >= 2);
+
+        compareBtn.Click += (_, _) => ShowCompareDialog();
+
+        var separator1 = new TextBlock
+        {
+            Text = "|",
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = new SolidColorBrush(Color.Parse("#E4E6EB")),
+            Margin = new Avalonia.Thickness(4, 0)
+        };
+
+        /* The label is held separately because the click handler below swaps the button's text for
+           confirmation and then swaps it back. It used to reassign Content wholesale, which with an
+           icon in there would throw the icon away with the old text. */
+        var copyReproLabel = new TextBlock
+        {
+            Text = "Copy Repro",
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        var copyReproBtn = new Button
+        {
+            Content = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = AppIcons.IconLabelGap,
+                VerticalAlignment = VerticalAlignment.Center,
+                Children = { AppIcons.MakeIcon(AppIcons.CopyRepro), copyReproLabel }
+            },
+            Height = 28,
+            Padding = new Avalonia.Thickness(10, 0),
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(0, 0, 6, 0),
+            VerticalContentAlignment = VerticalAlignment.Center,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+
+        Func<System.Threading.Tasks.Task> copyRepro = async () =>
+        {
+            if (viewer.CurrentPlan == null) return;
+            var queryText = GetQueryTextFromPlan(viewer);
+            var planXml = viewer.RawXml;
+            var database = ExtractDatabaseFromPlanXml(planXml);
+
+            var reproScript = ReproScriptBuilder.BuildReproScript(
+                queryText, database, planXml,
+                isolationLevel: null, source: "Performance Studio");
+
+            copyReproLabel.Text = await ClipboardHelper.TrySetTextAsync(this, reproScript)
+                ? "Copied!"
+                : "Clipboard busy";
+            await Task.Delay(1500);
+            copyReproLabel.Text = "Copy Repro";
+        };
+
+        copyReproBtn.Click += async (_, _) => await copyRepro();
+
+        // Wire up context menu events from PlanViewerControl
+        viewer.HumanAdviceRequested += (_, _) => showHumanAdvice();
+        viewer.RobotAdviceRequested += (_, _) => showRobotAdvice();
+        viewer.CopyReproRequested += async (_, _) => await copyRepro();
+        viewer.OpenInEditorRequested += (_, queryText) =>
+        {
+            _queryCounter++;
+            var session = new QuerySessionControl(_credentialService, _connectionStore);
+            session.QueryEditor.Text = queryText;
+            var tab = CreateTab($"Query {_queryCounter}", session);
+            MainTabControl.Items.Add(tab);
+            MainTabControl.SelectedItem = tab;
+            UpdateEmptyOverlay();
+        };
+
+        var getActualPlanBtn = new Button
+        {
+            Content = AppIcons.MakeContent(AppIcons.RunRepro, "Run Repro"),
+            Height = 28,
+            Padding = new Avalonia.Thickness(10, 0),
+            FontSize = 12,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+
+        getActualPlanBtn.Click += async (_, _) =>
+        {
+            if (viewer.CurrentPlan == null) return;
+            await GetActualPlanFromFile(viewer);
+        };
+
+        var separator2 = new TextBlock
+        {
+            Text = "|",
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = new SolidColorBrush(Color.Parse("#E4E6EB")),
+            Margin = new Avalonia.Thickness(4, 0)
+        };
+
+        var queryStoreBtn = new Button
+        {
+            Content = AppIcons.MakeContent(AppIcons.QueryStore, "Query Store"),
+            Height = 28,
+            Padding = new Avalonia.Thickness(10, 0),
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(6, 0, 0, 0),
+            VerticalContentAlignment = VerticalAlignment.Center,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+        ToolTip.SetTip(queryStoreBtn, "Open a Query Store session");
+        queryStoreBtn.Click += (_, _) =>
+        {
+            _queryCounter++;
+            var session = new QuerySessionControl(_credentialService, _connectionStore);
+            var tab = CreateTab($"Query {_queryCounter}", session);
+            MainTabControl.Items.Add(tab);
+            MainTabControl.SelectedItem = tab;
+            UpdateEmptyOverlay();
+            session.TriggerQueryStore();
+        };
+
+        var toolbar = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Avalonia.Thickness(8, 6),
+            Children = { humanBtn, robotBtn, compareBtn, separator1, copyReproBtn, getActualPlanBtn, separator2, queryStoreBtn }
+        };
+
+        var panel = new DockPanel();
+        DockPanel.SetDock(toolbar, Dock.Top);
+        panel.Children.Add(toolbar);
+        panel.Children.Add(viewer);
+
+        return panel;
+    }
+
+    private void ShowAdviceWindow(string title, string content, AnalysisResult? analysis = null, PlanViewerControl? sourceViewer = null)
+    {
+        AdviceWindowHelper.Show(this, title, content, analysis, sourceViewer);
+    }
+
+    internal void ShowCompareDialog()
+    {
+        var planTabs = CollectAllPlanTabs();
+        if (planTabs.Count < 2)
+        {
+            /* Belt and braces: every Compare button in the window is disabled while this is
+               true (see RefreshComparePlanAvailability), so no click can reach here. It used to
+               be the only thing standing between a click and a dialog, which is exactly how the
+               button came to answer a click with nothing at all. */
+            return;
+        }
+
+        var items = planTabs.Select(t => t.label).ToList();
+
+        var comboA = new ComboBox
+        {
+            ItemsSource = items,
+            SelectedIndex = 0,
+            Width = 250,
+            Height = 28,
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(8, 0, 0, 0)
+        };
+
+        var comboB = new ComboBox
+        {
+            ItemsSource = items,
+            SelectedIndex = items.Count > 1 ? 1 : 0,
+            Width = 250,
+            Height = 28,
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(8, 0, 0, 0)
+        };
+
+        var compareBtn = new Button
+        {
+            Content = "Compare",
+            Height = 32,
+            Padding = new Avalonia.Thickness(16, 0),
+            FontSize = 12,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+
+        var cancelBtn = new Button
+        {
+            Content = "Cancel",
+            Height = 32,
+            Padding = new Avalonia.Thickness(16, 0),
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(8, 0, 0, 0),
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+
+        void UpdateCompareEnabled()
+        {
+            compareBtn.IsEnabled = comboA.SelectedIndex >= 0 && comboB.SelectedIndex >= 0
+                && comboA.SelectedIndex != comboB.SelectedIndex;
+        }
+
+        comboA.SelectionChanged += (_, _) => UpdateCompareEnabled();
+        comboB.SelectionChanged += (_, _) => UpdateCompareEnabled();
+        UpdateCompareEnabled();
+
+        var rowA = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Avalonia.Thickness(0, 0, 0, 8),
+            Children =
+            {
+                new TextBlock { Text = "Plan A:", VerticalAlignment = VerticalAlignment.Center, FontSize = 13, Width = 55 },
+                comboA
+            }
+        };
+
+        var rowB = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Children =
+            {
+                new TextBlock { Text = "Plan B:", VerticalAlignment = VerticalAlignment.Center, FontSize = 13, Width = 55 },
+                comboB
+            }
+        };
+
+        var buttonPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Margin = new Avalonia.Thickness(0, 16, 0, 0),
+            Children = { compareBtn, cancelBtn }
+        };
+
+        var content = new StackPanel
+        {
+            Margin = new Avalonia.Thickness(20),
+            Children =
+            {
+                new TextBlock { Text = "Select two plans to compare:", FontSize = 14, Margin = new Avalonia.Thickness(0, 0, 0, 12) },
+                rowA,
+                rowB,
+                buttonPanel
+            }
+        };
+
+        var dialog = new Window
+        {
+            Title = "Compare Plans",
+            Width = 420,
+            Height = 220,
+            MinWidth = 420,
+            MinHeight = 220,
+            Icon = this.Icon,
+            Background = new SolidColorBrush(Color.Parse("#1A1D23")),
+            Foreground = new SolidColorBrush(Color.Parse("#E4E6EB")),
+            Content = content,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner
+        };
+
+        compareBtn.Click += (_, _) =>
+        {
+            var idxA = comboA.SelectedIndex;
+            var idxB = comboB.SelectedIndex;
+            if (idxA < 0 || idxB < 0 || idxA == idxB) return;
+
+            var (labelA, viewerA) = planTabs[idxA];
+            var (labelB, viewerB) = planTabs[idxB];
+
+            var analysisA = ResultMapper.Map(viewerA.CurrentPlan!, "file", capturedQueryText: viewerA.QueryText);
+            var analysisB = ResultMapper.Map(viewerB.CurrentPlan!, "file", capturedQueryText: viewerB.QueryText);
+
+            dialog.Close();
+            Dialogs.ComparisonWindow.Show(this, analysisA, analysisB, labelA, labelB);
+        };
+
+        cancelBtn.Click += (_, _) => dialog.Close();
+
+        dialog.ShowDialog(this);
+    }
+
+    /// <summary>
+    /// Extracts the database name from plan XML's StmtSimple DatabaseContext attribute.
+    /// </summary>
+    private static string? ExtractDatabaseFromPlanXml(string? planXml)
+    {
+        if (string.IsNullOrEmpty(planXml)) return null;
+
+        try
+        {
+            var doc = PlanXml.Parse(planXml);
+            XNamespace ns = "http://schemas.microsoft.com/sqlserver/2004/07/showplan";
+            var stmt = doc.Descendants(ns + "StmtSimple").FirstOrDefault();
+            var dbContext = stmt?.Attribute("DatabaseContext")?.Value;
+            if (!string.IsNullOrEmpty(dbContext))
+                return dbContext.Trim('[', ']');
+        }
+        catch { }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Prompts for a connection, then executes the query from the plan to get an actual plan.
+    /// </summary>
+    private async Task GetActualPlanFromFile(PlanViewerControl viewer)
+    {
+        var queryText = GetQueryTextFromPlan(viewer);
+        if (string.IsNullOrEmpty(queryText))
+        {
+            ShowError("No query text available in this plan.");
+            return;
+        }
+
+        // Show connection dialog
+        var dialog = new Dialogs.ConnectionDialog(_credentialService, _connectionStore);
+        var result = await dialog.ShowDialog<bool?>(this);
+        if (result != true || dialog.ResultConnection == null)
+            return;
+
+        var database = dialog.ResultDatabase ?? ExtractDatabaseFromPlanXml(viewer.RawXml);
+
+        /* Confirm before running it. The query session asks first; this path did
+           not, and it is the riskier of the two: the SQL comes out of a .sqlplan
+           the user opened rather than something they typed, and plan files get
+           emailed around. Name the target so "which server was that?" is answered
+           before the query runs, not after. */
+        var target = string.IsNullOrEmpty(database)
+            ? dialog.ResultConnection.ServerName
+            : $"{dialog.ResultConnection.ServerName}, database [{database}]";
+
+        var confirmed = await Dialogs.ConfirmationDialog.ShowAsync(
+            this,
+            "Get Actual Plan",
+            $"This will execute the query stored in this plan file against:\n\n{target}\n\n" +
+            "The query text comes from the plan file, not from you. Review it first if the file did not originate on this machine.\n\n" +
+            "It runs with SET STATISTICS XML ON and all data results are discarded.\n\nContinue?");
+
+        if (!confirmed) return;
+
+        var connectionString = dialog.ResultConnection.GetConnectionString(_credentialService, database);
+        var isAzure = dialog.ResultConnection.ServerName.Contains(".database.windows.net",
+                          StringComparison.OrdinalIgnoreCase) ||
+                      dialog.ResultConnection.ServerName.Contains(".database.azure.com",
+                          StringComparison.OrdinalIgnoreCase);
+
+        var cts = new System.Threading.CancellationTokenSource();
+
+        // Create a loading placeholder tab immediately
+        var progress = new CaptureProgressPanel(this, "Executing query...", cts);
+        var tab = AddLoadingTab("Actual Plan", progress.Root, cts);
+
+        try
+        {
+            // Fetch server metadata for advice and Plan Insights
+            ServerMetadata? metadata = null;
+            try
+            {
+                metadata = await ServerMetadataService.FetchServerMetadataAsync(
+                    connectionString, isAzure);
+                metadata.Database = await ServerMetadataService.FetchDatabaseMetadataAsync(
+                    connectionString, metadata.SupportsScopedConfigs);
+            }
+            catch { /* Non-fatal — advice will just lack server context */ }
+
+            progress.StatusLabel.Text = "Capturing actual plan...";
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            var actualPlanXml = await ActualPlanExecutor.ExecuteForActualPlanAsync(
+                connectionString, database, queryText,
+                viewer.RawXml, isolationLevel: null,
+                isAzureSqlDb: isAzure, timeoutSeconds: 0, cts.Token);
+
+            sw.Stop();
+
+            /* Closing the tab cancels this run, but the answer can already be on its way back.
+               Building a viewer for a tab nobody can see would register a plan that nothing is
+               left to unregister. */
+            cts.Token.ThrowIfCancellationRequested();
+
+            if (string.IsNullOrEmpty(actualPlanXml))
+            {
+                progress.ShowOutcome($"No actual plan returned ({sw.Elapsed.TotalSeconds:F1}s).");
+                return;
+            }
+
+            // Replace loading content with the actual plan
+            var actualViewer = new PlanViewerControl();
+            actualViewer.Metadata = metadata;
+            // Inherit the connection used to run the repro so schema lookups
+            // (Show Indexes, Show Table Definition) remain available on the
+            // new plan tab.
+            actualViewer.ConnectionString = connectionString;
+            actualViewer.SetConnectionServices(_credentialService, _connectionStore);
+            /* Adopt, not just paint: this tab's toolbar is visible, and status alone left the
+               database picker disabled and empty under a green server label. The dialog already
+               enumerated the databases this login can see. */
+            actualViewer.AdoptConnection(dialog.ResultConnection, database, dialog.ResultDatabases);
+            actualViewer.LoadPlan(actualPlanXml, "Actual Plan", queryText);
+
+            tab.Content = CreatePlanTabContent(actualViewer);
+        }
+        catch (Exception ex) when (CancellationHelper.IsCancellation(ex, cts.Token))
+        {
+            await EndCancelledCaptureAsync(tab);
+        }
+        catch (Exception ex)
+        {
+            progress.ShowFailure(ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Ends a Run Repro that the user cancelled, the way the query session ends a cancelled
+    /// capture: the user stopped the run with Cancel, Escape or by closing the tab, and the spinner
+    /// tab going away says so.
+    ///
+    /// <para>The cancel used to fall through to the error handler and show up as an error. The
+    /// caller decides by the run's token, not the exception type, because SqlClient reports a
+    /// cancel that lands while the query is running as a SqlException ("Operation cancelled by
+    /// user.").</para>
+    ///
+    /// <para>A tab closed by hand has already left the strip, and its panel with it, so there is
+    /// nothing left to end. #627: closing is now the only way a tab leaves the strip while its run
+    /// is going. Detaching it was the other, and it needed a second branch here that told the
+    /// detached window's panel "Cancelled."; a running capture cannot be detached any more, so the
+    /// branch is gone.</para>
+    ///
+    /// <para>Internal so a test can cancel a capture without a server to run one against.</para>
+    /// </summary>
+    internal async Task EndCancelledCaptureAsync(TabItem tab)
+    {
+        if (MainTabControl.Items.Contains(tab))
+            await TryCloseTabAsync(tab);
+    }
+}

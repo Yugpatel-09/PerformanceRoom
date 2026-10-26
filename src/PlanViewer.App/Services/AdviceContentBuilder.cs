@@ -1,0 +1,453 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Avalonia.Controls;
+using Avalonia.Controls.Documents;
+using Avalonia.Layout;
+using Avalonia.Media;
+using PlanViewer.Core.Output;
+using PlanViewer.Core.Services;
+
+namespace PlanViewer.App.Services;
+
+/// <summary>
+/// Builds styled content for the Advice for Humans window.
+/// Shared between MainWindow (file mode) and QuerySessionControl (query mode).
+/// </summary>
+internal static partial class AdviceContentBuilder
+{
+    /* Colours resolve from the design tokens (DarkTheme.axaml) wherever a token means the same
+       thing, so this window cannot drift from the app again; the fallbacks match the tokens byte
+       for byte. The card path adds no literals of its own — see AdviceContentBuilder.Cards.cs.
+
+       What is still literal below is this pane's own presentation palette — the SQL keyword blue,
+       the operator purple, the code green, the link blue, the triage card's ground and the section
+       rule — and none of them has a token to resolve to. Inventing one means editing
+       DarkTheme.axaml, which is a change to the app's palette rather than to this window. */
+    private static SolidColorBrush FromTheme(string key, string fallbackHex) =>
+        Avalonia.Application.Current?.TryGetResource(key, null, out var value) == true
+            && value is SolidColorBrush brush
+            ? brush
+            : new SolidColorBrush(Color.Parse(fallbackHex));
+
+    private static readonly SolidColorBrush HeaderBrush = new(Color.Parse("#4FA3FF"));
+    private static readonly SolidColorBrush CriticalBrush = FromTheme("ErrorBrush", "#E57373");
+    private static readonly SolidColorBrush WarningBrush = FromTheme("WarningBrush", "#FFB347");
+    private static readonly SolidColorBrush InfoBrush = new(Color.Parse("#6BB5FF"));
+    private static readonly SolidColorBrush LabelBrush = FromTheme("ForegroundBrush", "#E4E6EB");
+    private static readonly SolidColorBrush ValueBrush = FromTheme("ForegroundBrush", "#E4E6EB");
+    private static readonly SolidColorBrush CodeBrush = new(Color.Parse("#7BCF7B"));
+    /* Subordinate text: stats under an operator, the detail lines of a warning, a wait's label.
+       This was #E4E6EB — the full-strength foreground under a name promising the opposite, so
+       "muted" detail was painted in exactly the same ink as the value it sat under. */
+    private static readonly SolidColorBrush MutedBrush = FromTheme("ForegroundMutedBrush", "#B0B6C0");
+    private static readonly SolidColorBrush OperatorBrush = new(Color.Parse("#C792EA"));
+    private static readonly SolidColorBrush SqlKeywordBrush = new(Color.Parse("#569CD6"));
+    private static readonly SolidColorBrush SeparatorBrush = new(Color.Parse("#2A2D35"));
+    private static readonly SolidColorBrush CardBackgroundBrush = new(Color.Parse("#1A2233"));
+    private static readonly FontFamily MonoFont = new("Consolas, Menlo, monospace");
+
+    private const double MaxBarWidth = 200.0;
+
+    private static readonly HashSet<string> PhysicalOperators = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Sort", "Filter", "Bitmap", "Hash Match", "Merge Join", "Nested Loops",
+        "Stream Aggregate", "Compute Scalar", "Table Scan", "Index Scan",
+        "Clustered Index Scan", "Table Spool", "Index Spool", "Constant Scan",
+        "Concatenation", "Assert", "Segment", "Sequence Project", "Window Aggregate",
+        "Adaptive Join", "Row Count Spool", "Lazy Spool", "Eager Spool",
+        "Columnstore Index Scan", "Batch Hash Table Build", "Parallelism",
+        "Top", "Index Seek", "Clustered Index Seek", "RID Lookup",
+        "Key Lookup", "Clustered Index Update", "Clustered Index Insert",
+        "Clustered Index Delete", "Table Insert", "Table Delete"
+    };
+
+    private static readonly HashSet<string> SqlKeywords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS",
+        "ON", "AND", "OR", "NOT", "IN", "EXISTS", "BETWEEN", "LIKE", "IS", "NULL",
+        "INSERT", "INTO", "UPDATE", "SET", "DELETE", "MERGE", "USING", "MATCHED",
+        "GROUP", "BY", "ORDER", "HAVING", "UNION", "ALL", "EXCEPT", "INTERSECT",
+        "TOP", "DISTINCT", "AS", "WITH", "CTE", "OVER", "PARTITION", "ROW_NUMBER",
+        "CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "CONVERT", "COALESCE",
+        "CREATE", "ALTER", "DROP", "INDEX", "TABLE", "VIEW", "PROCEDURE", "FUNCTION",
+        "EXEC", "EXECUTE", "DECLARE", "BEGIN", "RETURN", "IF", "WHILE",
+        "ASC", "DESC", "OFFSET", "FETCH", "NEXT", "ROWS", "ONLY",
+        "COUNT", "SUM", "AVG", "MIN", "MAX", "APPLY", "PIVOT", "UNPIVOT",
+        "NONCLUSTERED", "CLUSTERED", "INCLUDE", "OPTION", "RECOMPILE", "MAXDOP",
+        "NOLOCK", "READUNCOMMITTED", "READCOMMITTED", "SERIALIZABLE", "HOLDLOCK"
+    };
+
+    private static readonly Regex CpuPercentRegex = new(@"(\d+)%\)", RegexOptions.Compiled);
+
+    // Matches "Node N" or "(Node N)" references in text
+    private static readonly Regex NodeRefRegex = new(@"(?<=\(?)\bNode\s+(\d+)\b(?=\)?)", RegexOptions.Compiled);
+
+    private static readonly SolidColorBrush LinkBrush = new(Color.Parse("#4FC3F7"));
+    private static readonly Avalonia.Input.Cursor HandCursor = new(Avalonia.Input.StandardCursorType.Hand);
+
+    public static StackPanel Build(string content)
+    {
+        return Build(content, null, null);
+    }
+
+    public static StackPanel Build(string content, AnalysisResult? analysis)
+    {
+        return Build(content, analysis, null);
+    }
+
+    /// <summary>
+    /// The advice pane's content.
+    ///
+    /// <para>Two views over one model. When the caller has the <see cref="AnalysisResult"/> —
+    /// which Advice for Humans always does — the pane is built from that model as structured
+    /// cards. The plain-text report the Copy button hands out is the other view of the same
+    /// model, written by <see cref="TextFormatter"/>, and it is a frozen contract: people paste
+    /// it into tickets. Nothing on the card path touches <paramref name="content"/>, so the two
+    /// cannot drift.</para>
+    ///
+    /// <para>With no model — Advice for Robots, whose content is raw JSON — the text is all
+    /// there is, and <see cref="BuildFromText"/> renders it line by line as before.</para>
+    /// </summary>
+    public static StackPanel Build(string content, AnalysisResult? analysis, Action<int>? onNodeClick)
+    {
+        return analysis != null
+            ? BuildCards(analysis, onNodeClick)
+            : BuildFromText(content, analysis, onNodeClick);
+    }
+
+    private static StackPanel BuildFromText(string content, AnalysisResult? analysis, Action<int>? onNodeClick)
+    {
+        var panel = new StackPanel { Margin = new Avalonia.Thickness(4, 0) };
+        var lines = content.Split('\n');
+        // #503: consecutive body lines go into one selectable block instead of one per line.
+        var body = new BodyTextAccumulator();
+        var inCodeBlock = false;
+        var codeBlockIndent = 0;
+        var isStatementText = false;
+        var inSubSection = false; // tracks sub-sections within a statement
+        var statementIndex = -1; // tracks which statement we're in (0-based)
+        var needsTriageCard = false; // inject card on next blank line after SQL text
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i].TrimEnd('\r');
+
+            // Empty lines — small spacer
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                // Inject triage card on the blank line between SQL text and details
+                if (needsTriageCard && analysis != null && statementIndex >= 0
+                    && statementIndex < analysis.Statements.Count)
+                {
+                    var card = CreateTriageSummaryCard(analysis.Statements[statementIndex]);
+                    if (card != null)
+                    {
+                        body.Flush(panel);
+                        panel.Children.Add(card);
+                    }
+                    needsTriageCard = false;
+                }
+
+                // Kept inside the current block: a blank line between a section's lines belongs to
+                // that section, and breaking here would drop a selection boundary in the middle of
+                // what the user is dragging across.
+                body.AddBlankLine();
+                inCodeBlock = false;
+                isStatementText = false;
+                inSubSection = false;
+                continue;
+            }
+
+            // Section headers: === ... ===
+            if (line.StartsWith("===") && line.EndsWith("==="))
+            {
+                inCodeBlock = false;
+                isStatementText = false;
+                inSubSection = false;
+
+                body.Flush(panel);
+
+                // Strip === markers, just show the text
+                var headerText = line.Trim('=', ' ');
+
+                // Add separator before non-first headers
+                if (panel.Children.Count > 0)
+                {
+                    panel.Children.Add(new Border
+                    {
+                        Height = 1,
+                        Background = SeparatorBrush,
+                        Margin = new Avalonia.Thickness(0, 10, 0, 6)
+                    });
+                }
+
+                panel.Children.Add(new SelectableTextBlock
+                {
+                    Text = headerText,
+                    FontFamily = MonoFont,
+                    FontSize = 14,
+                    FontWeight = FontWeight.Bold,
+                    Foreground = HeaderBrush,
+                    Margin = new Avalonia.Thickness(0, 0, 0, 6),
+                    TextWrapping = TextWrapping.Wrap
+                });
+
+                // Statement text follows "Statement N:"
+                if (headerText.StartsWith("Statement"))
+                {
+                    isStatementText = true;
+                    statementIndex++;
+                    needsTriageCard = true;
+                }
+
+                continue;
+            }
+
+            // Statement text (SQL) — highlight keywords
+            if (isStatementText)
+            {
+                body.AddLine(BuildSqlHighlightedLine(line));
+                continue;
+            }
+
+            // Warning lines: [Critical], [Warning], [Info] — with left accent border
+            if (line.Contains("[Critical]"))
+            {
+                body.Flush(panel);
+                panel.Children.Add(CreateWarningBlock(line, CriticalBrush));
+                continue;
+            }
+            if (line.Contains("[Warning]"))
+            {
+                body.Flush(panel);
+                panel.Children.Add(CreateWarningBlock(line, WarningBrush));
+                continue;
+            }
+            if (line.Contains("[Info]"))
+            {
+                body.Flush(panel);
+                panel.Children.Add(CreateWarningBlock(line, InfoBrush));
+                continue;
+            }
+
+            var trimmed = line.TrimStart();
+
+            // Grouped explanation line: "  -> The overestimate may have..."
+            if (trimmed.StartsWith("-> "))
+            {
+                body.AddLine(20, new Run(trimmed[3..])
+                {
+                    FontStyle = Avalonia.Media.FontStyle.Italic,
+                    Foreground = MutedBrush
+                });
+                continue;
+            }
+
+            // SNIFFING marker
+            if (line.Contains("[SNIFFING]"))
+            {
+                var sniffIdx = line.IndexOf("[SNIFFING]");
+                body.AddLine(
+                    12,
+                    new Run(line[..sniffIdx].TrimStart()) { Foreground = ValueBrush },
+                    new Run("[SNIFFING]") { Foreground = CriticalBrush, FontWeight = FontWeight.SemiBold });
+                continue;
+            }
+
+            // Missing index impact line: "dbo.Posts (impact: 95%)"
+            if (trimmed.Contains("(impact:") && trimmed.EndsWith("%)"))
+            {
+                body.Flush(panel);
+                panel.Children.Add(CreateMissingIndexImpactLine(trimmed));
+                continue;
+            }
+
+            // CREATE INDEX lines (multi-line: CREATE..., ON..., INCLUDE..., WHERE...)
+            if (trimmed.StartsWith("CREATE", StringComparison.OrdinalIgnoreCase))
+            {
+                inCodeBlock = true;
+                codeBlockIndent = line.Length - trimmed.Length;
+            }
+            else if (inCodeBlock)
+            {
+                if (trimmed.StartsWith("ON ", StringComparison.OrdinalIgnoreCase) ||
+                    trimmed.StartsWith("INCLUDE ", StringComparison.OrdinalIgnoreCase) ||
+                    trimmed.StartsWith("WHERE ", StringComparison.OrdinalIgnoreCase) ||
+                    trimmed.StartsWith("WITH ", StringComparison.OrdinalIgnoreCase))
+                { /* still in code block */ }
+                else
+                    inCodeBlock = false;
+            }
+
+            if (inCodeBlock)
+            {
+                var currentIndent = line.Length - trimmed.Length;
+                var displayLine = currentIndent < codeBlockIndent
+                    ? new string(' ', codeBlockIndent) + trimmed
+                    : line;
+
+                body.AddLine(12, displayLine, CodeBrush);
+                continue;
+            }
+
+            // Expensive operators section: highlight operator name + grouped timing + stats
+            // Handles both "Operator (Object):" and bare "Sort:" forms
+            if (trimmed.EndsWith("):") ||
+                (trimmed.EndsWith(":") && PhysicalOperators.Contains(trimmed[..^1])))
+            {
+                // Peek ahead for timing line and stats line to group with operator
+                string? timingLine = null;
+                string? statsLine = null;
+                var peekIdx = i + 1;
+                if (peekIdx < lines.Length)
+                {
+                    var nextTrimmed = lines[peekIdx].TrimEnd('\r').TrimStart();
+                    if ((nextTrimmed.Contains("ms CPU") || nextTrimmed.Contains("ms elapsed"))
+                        && nextTrimmed.Length > 0 && char.IsDigit(nextTrimmed[0]))
+                    {
+                        timingLine = nextTrimmed;
+                        peekIdx++;
+                    }
+                }
+                // Stats line: "17,142,169 rows, 4,691,534 logical reads, 884 physical reads"
+                if (peekIdx < lines.Length)
+                {
+                    var nextTrimmed = lines[peekIdx].TrimEnd('\r').TrimStart();
+                    if (nextTrimmed.Contains("rows") && nextTrimmed.Length > 0
+                        && char.IsDigit(nextTrimmed[0]))
+                    {
+                        statsLine = nextTrimmed;
+                        peekIdx++;
+                    }
+                }
+                i = peekIdx - 1; // skip consumed lines
+                body.Flush(panel);
+                panel.Children.Add(CreateOperatorGroup(line, timingLine, statsLine));
+                continue;
+            }
+
+            // Standalone timing lines (fallback for lines not grouped with an operator)
+            if ((trimmed.Contains("ms CPU") || trimmed.Contains("ms elapsed"))
+                && trimmed.Length > 0 && char.IsDigit(trimmed[0]))
+            {
+                body.Flush(panel);
+                panel.Children.Add(CreateOperatorTimingLine(trimmed));
+                continue;
+            }
+
+            // Sub-section labels within a statement: "Warnings:", "Parameters:", "Wait stats:", etc.
+            // These have a space or end with ":" after trimming
+            if (IsSubSectionLabel(trimmed))
+            {
+                inSubSection = true;
+                body.AddLine(8, new Run(trimmed)
+                {
+                    FontSize = 13,
+                    FontWeight = FontWeight.SemiBold,
+                    Foreground = LabelBrush
+                });
+                continue;
+            }
+
+            // Bullet lines: "   * ..."
+            if (trimmed.StartsWith("* "))
+            {
+                body.AddLine(12, line, MutedBrush);
+                continue;
+            }
+
+            // Wait stats lines: "  WAITTYPE: 1,234ms" — color by category with proportional bars
+            // Collect entire group, find global max, then render all with consistent bar scaling
+            if (trimmed.Contains("ms") && trimmed.Contains(':'))
+            {
+                var waitColon = trimmed.IndexOf(':');
+                if (waitColon > 0 && waitColon < trimmed.Length - 1)
+                {
+                    var waitName = trimmed[..waitColon];
+                    var waitValue = trimmed[(waitColon + 1)..].Trim();
+                    if (waitValue.EndsWith("ms") && waitName == waitName.ToUpperInvariant() && !waitName.Contains(' '))
+                    {
+                        // Collect all wait stat lines in this group
+                        var waitGroup = new List<(string name, string value)>
+                        {
+                            (waitName, waitValue)
+                        };
+                        while (i + 1 < lines.Length)
+                        {
+                            var nextLine = lines[i + 1].TrimEnd('\r').TrimStart();
+                            if (string.IsNullOrWhiteSpace(nextLine)) break;
+                            var nextColon = nextLine.IndexOf(':');
+                            if (nextColon <= 0 || nextColon >= nextLine.Length - 1) break;
+                            var nextName = nextLine[..nextColon];
+                            var nextVal = nextLine[(nextColon + 1)..].Trim();
+                            if (!nextVal.EndsWith("ms") || nextName != nextName.ToUpperInvariant()
+                                || nextName.Contains(' '))
+                                break;
+                            waitGroup.Add((nextName, nextVal));
+                            i++;
+                        }
+
+                        // Find global max for bar scaling
+                        var maxWaitMs = 0.0;
+                        foreach (var (_, val) in waitGroup)
+                        {
+                            var ms = ParseWaitMs(val);
+                            if (ms > maxWaitMs) maxWaitMs = ms;
+                        }
+
+                        // Render all lines with consistent scaling
+                        body.Flush(panel);
+                        foreach (var (name, val) in waitGroup)
+                            panel.Children.Add(CreateWaitStatLine(name, val, maxWaitMs));
+
+                        continue;
+                    }
+                }
+            }
+
+            // Key-value lines: "Label: value"
+            var colonIdx = line.IndexOf(':');
+            if (colonIdx > 0 && colonIdx < line.Length - 1)
+            {
+                var labelPart = line[..colonIdx].TrimStart();
+                if (labelPart.Length < 40 && !labelPart.Contains('(') && !labelPart.Contains('='))
+                {
+                    var indent = inSubSection ? 12.0 : 8.0;
+                    body.AddLine(
+                        indent,
+                        new Run(labelPart + ":") { Foreground = LabelBrush },
+                        new Run(line[(colonIdx + 1)..]) { Foreground = ValueBrush });
+                    continue;
+                }
+            }
+
+            // Default: regular text
+            body.AddLine(0, line, ValueBrush);
+        }
+
+        body.Flush(panel);
+
+        // Post-process: make "Node N" references clickable
+        if (onNodeClick != null)
+            MakeNodeRefsClickable(panel, onNodeClick);
+
+        MakeTextBlocksHitTestable(panel);
+
+        return panel;
+    }
+
+
+    private static bool IsSubSectionLabel(string trimmed)
+    {
+        // "Warnings:", "Parameters:", "Wait stats:", "Operator warnings:",
+        // "Missing indexes:", "Expensive operators:"
+        if (!trimmed.EndsWith(":")) return false;
+        var label = trimmed[..^1];
+        // Sub-section labels are short, may contain spaces, and are all-alpha
+        return label.Length < 30 && !label.Contains('=') && !label.Contains('(');
+    }
+
+
+}

@@ -1,0 +1,109 @@
+# Contributing to Performance Room
+
+Thank you for your interest in contributing to Performance Room! This guide will help you get started.
+
+## Reporting Issues
+
+- Use [GitHub Issues](https://github.com/Yugpatel-09/PerformanceRoom/issues) for bugs and feature requests
+- Include the `.sqlplan` file (or a minimal reproduction) when reporting parser or analysis bugs
+- Specify your OS and .NET version
+
+## Development Setup
+
+### Prerequisites
+
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+- Git
+
+### Build and Test
+
+```bash
+git clone https://github.com/Yugpatel-09/PerformanceRoom.git
+cd PerformanceRoom
+dotnet build
+dotnet test tests/PlanViewer.Core.Tests
+```
+
+### Run the GUI
+
+```bash
+dotnet run --project src/PlanViewer.App
+```
+
+### Run the CLI
+
+```bash
+dotnet run --project src/PlanViewer.Cli -- analyze --help
+```
+
+## Project Structure
+
+```
+PerformanceStudio/
+├── src/
+│   ├── PlanViewer.Core/       # Analysis engine (parser, rules, layout)
+│   ├── PlanViewer.App/        # Avalonia desktop GUI
+│   └── PlanViewer.Cli/        # CLI tool (planview command)
+└── tests/
+    └── PlanViewer.Core.Tests/ # xUnit tests with real .sqlplan fixtures
+```
+
+## Architecture
+
+- **PlanViewer.Core** is the shared library. It contains the XML parser (`ShowPlanParser`), analysis rules (`PlanAnalyzer`), plan layout engine, text/JSON formatters, and all models. Both the GUI and CLI depend on it.
+- **PlanViewer.App** is an Avalonia 12 desktop app using code-behind (no MVVM framework). It renders plan trees on a Canvas with the same operator icons as SSMS.
+- **PlanViewer.Cli** is a System.CommandLine-based CLI tool that wraps Core for command-line use.
+
+## Code Style
+
+- File-scoped namespaces (`namespace Foo;`)
+- Nullable enabled across all projects
+- Code-behind pattern for UI (no MVVM, no ReactiveUI)
+- No unnecessary abstractions — keep it simple and direct
+- Tests use real `.sqlplan` XML fixtures, not mocks
+
+## Calling native code
+
+**Never call a variadic C function through a plain `DllImport`.** `fcntl`, `open`, `ioctl` and the
+`printf` family all take `...`, and on Apple arm64 variadic arguments are passed on the *stack* while
+a fixed-signature P/Invoke passes them in *registers*. The callee reads a stack slot you never wrote.
+
+This does not throw, and it does not return an error. In #441 `fcntl(F_GETPATH)` returned 0 for
+success and wrote up to 1KB through whatever pointer happened to be in that slot — an arbitrary write
+into the process on every call — while the buffer we passed came back empty. It made `dotnet test`
+unrunnable on macOS for months, sometimes as a GC livelock and sometimes as a deadlock, and CI never
+saw any of it because Linux and Windows take different branches.
+
+Use a non-variadic equivalent instead (`proc_pidfdinfo` in place of `fcntl(F_GETPATH)`, for example).
+`__arglist` is not an escape hatch — it throws `Vararg calling convention not supported` on this
+target.
+
+When you do P/Invoke a struct-returning native call, derive the offsets in a comment from the system
+header rather than leaving magic numbers, and check the returned size against what you expected. A
+layout change should fail loudly, not hand back plausible-looking wrong bytes.
+
+## Adding Analysis Rules
+
+Rules live in `PlanAnalyzer.cs`. Each rule:
+
+1. Inspects `PlanNode` properties (statement-level rules) or individual operator nodes
+2. Adds a `PlanWarning` with `WarningType`, `Message`, and `Severity` (Info, Warning, or Critical)
+3. Has a corresponding test in `PlanAnalyzerTests.cs` with a minimal `.sqlplan` fixture
+
+When adding a rule:
+- Add the rule logic to `AnalyzeStatement()` or `AnalyzeNode()` in `PlanAnalyzer.cs`
+- Create a minimal `.sqlplan` test fixture in `tests/PlanViewer.Core.Tests/Plans/`
+- Add a test method in `PlanAnalyzerTests.cs`
+- Ensure all existing tests still pass
+
+## Pull Requests
+
+1. Fork the repo and create a feature branch
+2. Make your changes
+3. Run `dotnet test` — all tests must pass
+4. Run `dotnet build` — no warnings or errors
+5. Open a PR with a clear description of what changed and why
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the MIT License.

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>InstallSsmsExtension</AssemblyName>
+    <RootNamespace>PlanViewer.Ssms.Installer</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="WindowsBase" />
+    <Reference Include="System.IO.Compression" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Lets tests/PlanViewer.Ssms.Installer.Tests call the internal signature check. -->
+    <InternalsVisibleTo Include="PlanViewer.Ssms.Installer.Tests" />
+  </ItemGroup>
+
+</Project>

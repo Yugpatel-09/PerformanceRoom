@@ -1,0 +1,477 @@
+using System.IO;
+
+namespace PlanViewer.Core.Output;
+
+public static class TextFormatter
+{
+    public static string Format(AnalysisResult result) =>
+        FormatCancellable(result, CancellationToken.None);
+
+    internal static string FormatCancellable(AnalysisResult result, CancellationToken cancellationToken)
+    {
+        using var writer = new StringWriter();
+        WriteTextCancellable(result, writer, cancellationToken);
+        return writer.ToString();
+    }
+
+    public static void WriteText(AnalysisResult result, TextWriter writer) =>
+        WriteTextCancellable(result, writer, CancellationToken.None);
+
+    internal static void WriteTextCancellable(
+        AnalysisResult result,
+        TextWriter writer,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        // Server context (connected mode only)
+        if (result.ServerContext != null)
+        {
+            WriteServerContext(result.ServerContext, writer, cancellationToken);
+        }
+        else if (result.SqlServerBuild != null)
+        {
+            writer.WriteLine($"SQL Server: {result.SqlServerBuild}");
+        }
+
+        writer.WriteLine("=== Summary ===");
+        writer.WriteLine($"Statements: {result.Summary.TotalStatements}");
+        writer.WriteLine($"Warnings: {result.Summary.TotalWarnings} ({result.Summary.CriticalWarnings} critical)");
+        if (result.Summary.SuppressedWarnings > 0)
+            writer.WriteLine($"Suppressed warnings: {result.Summary.SuppressedWarnings}");
+        writer.WriteLine($"Missing indexes: {result.Summary.MissingIndexes}");
+        writer.WriteLine($"Actual stats: {(result.Summary.HasActualStats ? "yes" : "no (estimated plan)")}");
+        if (result.Summary.WarningTypes.Count > 0)
+        {
+            writer.WriteLine("Warning types:");
+            foreach (var wt in result.Summary.WarningTypes)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                writer.WriteLine($"  {wt}");
+            }
+        }
+        writer.WriteLine();
+
+        for (int i = 0; i < result.Statements.Count; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var stmt = result.Statements[i];
+            writer.WriteLine($"=== Statement {i + 1}: ===");
+            writer.WriteLine(stmt.StatementText);
+            writer.WriteLine();
+            writer.WriteLine($"Estimated cost: {stmt.EstimatedCost:N2}");
+
+            if (stmt.DegreeOfParallelism > 0)
+            {
+                var dopLine = $"DOP: {stmt.DegreeOfParallelism}";
+                if (stmt.QueryTime != null && stmt.QueryTime.ElapsedTimeMs > 0
+                    && stmt.QueryTime.CpuTimeMs > 0 && stmt.DegreeOfParallelism > 1)
+                {
+                    var speedup = (double)stmt.QueryTime.CpuTimeMs / stmt.QueryTime.ElapsedTimeMs;
+                    var efficiency = Math.Clamp((speedup - 1.0) / (stmt.DegreeOfParallelism - 1.0) * 100.0, 0, 100);
+                    dopLine += $" ({efficiency:N0}% efficient)";
+                }
+                writer.WriteLine(dopLine);
+            }
+            if (stmt.NonParallelReason != null)
+                writer.WriteLine($"Serial reason: {stmt.NonParallelReason}");
+            if (stmt.QueryTime != null)
+                writer.WriteLine($"Runtime: {stmt.QueryTime.ElapsedTimeMs:N0}ms elapsed, {stmt.QueryTime.CpuTimeMs:N0}ms CPU");
+            if (stmt.MemoryGrant != null && stmt.MemoryGrant.GrantedKB > 0)
+            {
+                var pctUsed = stmt.MemoryGrant.GrantedKB > 0
+                    ? (double)stmt.MemoryGrant.MaxUsedKB / stmt.MemoryGrant.GrantedKB * 100 : 0;
+                var pctContext = "";
+                if (result.ServerContext?.MaxServerMemoryMB > 0)
+                {
+                    var grantedMB = stmt.MemoryGrant.GrantedKB / 1024.0;
+                    pctContext = $", {grantedMB / result.ServerContext.MaxServerMemoryMB * 100:N1}% of max server memory";
+                }
+                writer.WriteLine($"Memory grant: {FormatMemoryGrantKB(stmt.MemoryGrant.GrantedKB)} granted, {FormatMemoryGrantKB(stmt.MemoryGrant.MaxUsedKB)} used ({pctUsed:N0}% utilized{pctContext})");
+            }
+
+            // Expensive operators — promoted to right after memory grant.
+            // Answers "where did the time go?" before drilling into waits/warnings.
+            if (stmt.OperatorTree != null)
+            {
+                var nodeTimings = new List<(OperatorResult Node, long OwnCpuMs, long OwnElapsedMs)>();
+                CollectNodeTimings(stmt.OperatorTree, nodeTimings, cancellationToken);
+
+                var topNodes = nodeTimings
+                    .Where(t => t.OwnCpuMs > 0 || t.OwnElapsedMs > 0)
+                    .OrderByDescending(t => Math.Max(t.OwnCpuMs, t.OwnElapsedMs))
+                    .Take(5)
+                    .ToList();
+
+                if (topNodes.Count > 0)
+                {
+                    writer.WriteLine("Expensive operators:");
+                    var totalCpu = stmt.QueryTime?.CpuTimeMs > 0 ? stmt.QueryTime.CpuTimeMs : 0;
+                    var totalElapsed = stmt.QueryTime?.ElapsedTimeMs ?? 0;
+                    foreach (var (n, ownCpu, ownElapsed) in topNodes)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var label = n.ObjectName != null
+                            ? $"{n.PhysicalOp} ({n.ObjectName})"
+                            : n.PhysicalOp;
+                        var nodeId = $" (Node {n.NodeId})";
+
+                        writer.WriteLine($"  {label}{nodeId}:");
+
+                        // Timing on its own line
+                        var timeParts = new List<string>();
+                        if (ownCpu > 0)
+                        {
+                            var cpuPct = totalCpu > 0 ? $" ({ownCpu * 100.0 / totalCpu:N0}%)" : "";
+                            timeParts.Add($"{ownCpu:N0}ms CPU{cpuPct}");
+                        }
+                        if (ownElapsed > 0)
+                        {
+                            var elPct = totalElapsed > 0 ? $" ({ownElapsed * 100.0 / totalElapsed:N0}%)" : "";
+                            timeParts.Add($"{ownElapsed:N0}ms elapsed{elPct}");
+                        }
+                        if (timeParts.Count > 0)
+                            writer.WriteLine($"    {string.Join(", ", timeParts)}");
+
+                        var details = new List<string>();
+                        if (n.ActualRows > 0)
+                            details.Add($"{n.ActualRows:N0} rows");
+                        if (n.ActualLogicalReads > 0)
+                            details.Add($"{n.ActualLogicalReads:N0} logical reads");
+                        if (n.ActualPhysicalReads > 0)
+                            details.Add($"{n.ActualPhysicalReads:N0} physical reads");
+                        if (details.Count > 0)
+                            writer.WriteLine($"    {string.Join(", ", details)}");
+                    }
+                }
+            }
+
+            if (stmt.WaitStats.Count > 0)
+            {
+                writer.WriteLine("Wait stats:");
+                // Build a lookup from wait type to benefit %
+                var benefitLookup = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                foreach (var wb in stmt.WaitBenefits)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    benefitLookup[wb.WaitType] = wb.MaxBenefitPercent;
+                }
+
+                foreach (var w in stmt.WaitStats.OrderByDescending(w => w.WaitTimeMs))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var benefitTag = benefitLookup.TryGetValue(w.WaitType, out var pct)
+                        ? $" (up to {(pct >= 100 ? pct.ToString("N0") : pct.ToString("N1"))}% benefit)"
+                        : "";
+                    writer.WriteLine($"  {w.WaitType}: {w.WaitTimeMs:N0}ms{benefitTag}");
+                }
+            }
+
+            if (stmt.Parameters.Count > 0)
+            {
+                writer.WriteLine("Parameters:");
+                foreach (var p in stmt.Parameters)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var sniff = p.SniffingIssue ? " [SNIFFING]" : "";
+                    writer.WriteLine($"  {p.Name} {p.DataType} = {p.CompiledValue ?? "?"}{sniff}");
+                }
+            }
+
+            if (stmt.Warnings.Count > 0)
+            {
+                writer.WriteLine();
+                writer.WriteLine("Plan warnings:");
+                var hasDetailedMemoryGrant = stmt.Warnings.Any(w =>
+                    w.Type == "Excessive Memory Grant" || w.Type == "Large Memory Grant");
+                var sortedWarnings = stmt.Warnings
+                    .Where(w => !(w.Type == "Memory Grant" && hasDetailedMemoryGrant))
+                    .OrderByDescending(w => w.MaxBenefitPercent ?? -1)
+                    .ThenBy(w => w.Severity switch { "Critical" => 0, "Warning" => 1, _ => 2 })
+                    .ThenBy(w => w.Type);
+                foreach (var w in sortedWarnings)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var benefitTag = w.MaxBenefitPercent.HasValue
+                        ? $" (up to {(w.MaxBenefitPercent.Value >= 100 ? w.MaxBenefitPercent.Value.ToString("N0") : w.MaxBenefitPercent.Value.ToString("N1"))}% benefit)"
+                        : "";
+                    var legacyTag = w.IsLegacy ? " [legacy]" : "";
+                    writer.WriteLine($"  [{w.Severity}] {w.Type}{SourceTag(w.Source)}{legacyTag}{SuppressedTag(w)}{benefitTag}: {EscapeNewlines(w.Message)}");
+                    if (!string.IsNullOrEmpty(w.ActionableFix))
+                        writer.WriteLine($"    Fix: {EscapeNewlines(w.ActionableFix)}");
+                }
+            }
+
+            if (stmt.OperatorTree != null)
+            {
+                var nodeWarnings = new List<WarningResult>();
+                CollectNodeWarnings(stmt.OperatorTree, nodeWarnings, cancellationToken);
+                if (nodeWarnings.Count > 0)
+                {
+                    writer.WriteLine();
+                    writer.WriteLine("Operator warnings:");
+                    WriteGroupedOperatorWarnings(nodeWarnings, writer, cancellationToken);
+                }
+            }
+
+            if (stmt.MissingIndexes.Count > 0)
+            {
+                writer.WriteLine();
+                writer.WriteLine("Missing indexes:");
+                foreach (var mi in stmt.MissingIndexes)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    writer.WriteLine($"  {mi.Table} (impact: {mi.Impact:F0}%)");
+                    writer.WriteLine($"    {mi.CreateStatement}");
+                }
+            }
+
+            writer.WriteLine();
+        }
+    }
+
+    private static void WriteServerContext(
+        ServerContextResult ctx,
+        TextWriter writer,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        writer.WriteLine("=== Server Context ===");
+
+        // Server line: name + edition + version
+        var editionShort = ctx.Edition;
+        if (editionShort != null)
+        {
+            // Trim " (64-bit)" suffix if present
+            var parenIdx = editionShort.IndexOf(" (64-bit)");
+            if (parenIdx > 0) editionShort = editionShort[..parenIdx];
+        }
+
+        var versionParts = new List<string>();
+        if (ctx.ProductVersion != null) versionParts.Add(ctx.ProductVersion);
+        if (ctx.ProductLevel != null && ctx.ProductLevel != "RTM") versionParts.Add(ctx.ProductLevel);
+        var versionStr = versionParts.Count > 0 ? $", {string.Join(" ", versionParts)}" : "";
+
+        if (ctx.IsAzure)
+            writer.WriteLine($"  Server: {ctx.ServerName} (Azure SQL{versionStr})");
+        else if (editionShort != null)
+            writer.WriteLine($"  Server: {ctx.ServerName} ({editionShort}{versionStr})");
+        else
+            writer.WriteLine($"  Server: {ctx.ServerName}");
+
+        // Hardware
+        if (ctx.CpuCount > 0)
+            writer.WriteLine($"  Hardware: {ctx.CpuCount} CPUs, {ctx.PhysicalMemoryMB:N0} MB RAM");
+
+        // Instance settings
+        writer.WriteLine($"  MAXDOP: {ctx.MaxDop}  |  Cost threshold: {ctx.CostThresholdForParallelism}  |  Max memory: {ctx.MaxServerMemoryMB:N0} MB");
+
+        // Database
+        if (ctx.Database != null)
+        {
+            var db = ctx.Database;
+            writer.WriteLine($"  Database: {db.Name} (compat {db.CompatibilityLevel}, {db.CollationName})");
+
+            // Notable settings — only show when they deviate from healthy defaults
+            var notable = new List<string>();
+
+            // Isolation — show if on
+            if (db.SnapshotIsolationState > 0)
+                notable.Add("Snapshot isolation: ON");
+            if (db.ReadCommittedSnapshot)
+                notable.Add("RCSI: ON");
+
+            // Stats — warn if off
+            if (!db.AutoCreateStats)
+                notable.Add("Auto create stats: OFF");
+            if (!db.AutoUpdateStats)
+                notable.Add("Auto update stats: OFF");
+            if (db.AutoUpdateStatsAsync)
+                notable.Add("Auto update stats async: ON");
+
+            // Parameterization
+            if (db.ParameterizationForced)
+                notable.Add("Forced parameterization: ON");
+
+            if (notable.Count > 0)
+            {
+                foreach (var n in notable)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    writer.WriteLine($"    {n}");
+                }
+            }
+
+            if (db.NonDefaultScopedConfigs.Count > 0)
+            {
+                writer.WriteLine("  Non-default scoped configs:");
+                foreach (var sc in db.NonDefaultScopedConfigs)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    writer.WriteLine($"    {sc.Name} = {sc.Value}");
+                }
+            }
+        }
+
+        writer.WriteLine();
+    }
+
+    private static void CollectNodeWarnings(
+        OperatorResult node,
+        List<WarningResult> warnings,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        warnings.AddRange(node.Warnings);
+        foreach (var child in node.Children)
+            CollectNodeWarnings(child, warnings, cancellationToken);
+    }
+
+    private static void WriteGroupedOperatorWarnings(
+        List<WarningResult> warnings,
+        TextWriter writer,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        // Sort by benefit descending (nulls last), then severity, then type
+        var sorted = warnings
+            .OrderByDescending(w => w.MaxBenefitPercent ?? -1)
+            .ThenBy(w => w.Severity switch { "Critical" => 0, "Warning" => 1, _ => 2 })
+            .ThenBy(w => w.Type)
+            .ToList();
+
+        // Split each message into "data | explanation" at the last sentence boundary
+        // that starts with "The " (the harm assessment). Group by shared explanation.
+        var entries = new List<(string Severity, string Operator, string Data, string? Explanation, double? Benefit, bool IsLegacy, string Source, string SuppressedTag)>();
+        foreach (var w in sorted)
+        {
+            var msg = w.Message;
+            string data;
+            string? explanation = null;
+
+            // Find the harm sentence: ". The overestimate/underestimate..."
+            var splitIdx = msg.LastIndexOf(". The ", StringComparison.Ordinal);
+            if (splitIdx > 0)
+            {
+                data = msg[..splitIdx].TrimEnd('.');
+                explanation = msg[(splitIdx + 2)..];
+            }
+            else
+            {
+                data = msg;
+            }
+
+            entries.Add((w.Severity, w.Operator ?? "?", data, explanation, w.MaxBenefitPercent, w.IsLegacy, w.Source, SuppressedTag(w)));
+        }
+
+        // Group entries that share the same severity, type, and explanation
+        // Preserve the pre-sorted order (benefit desc, severity, type)
+        var grouped = entries
+            .GroupBy(e => (e.Severity, e.Explanation ?? ""))
+            .ToList();
+
+        foreach (var group in grouped)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var items = group.ToList();
+            if (items.Count > 1 && group.Key.Item2 != "")
+            {
+                // Multiple operators with the same explanation — list compactly
+                foreach (var item in items)
+                {
+                    var legacyTag = item.IsLegacy ? " [legacy]" : "";
+                    var benefitTag = item.Benefit.HasValue
+                        ? $" (up to {(item.Benefit.Value >= 100 ? item.Benefit.Value.ToString("N0") : item.Benefit.Value.ToString("N1"))}% benefit)"
+                        : "";
+                    writer.WriteLine($"  [{item.Severity}] {item.Operator}{SourceTag(item.Source)}{legacyTag}{item.SuppressedTag}{benefitTag}: {EscapeNewlines(item.Data)}");
+                }
+                writer.WriteLine($"  -> {group.Key.Item2}");
+            }
+            else
+            {
+                // Unique explanation or no explanation — write individually
+                foreach (var item in items)
+                {
+                    var full = item.Explanation != null ? $"{item.Data}. {item.Explanation}" : item.Data;
+                    var legacyTag = item.IsLegacy ? " [legacy]" : "";
+                    var benefitTag = item.Benefit.HasValue
+                        ? $" (up to {(item.Benefit.Value >= 100 ? item.Benefit.Value.ToString("N0") : item.Benefit.Value.ToString("N1"))}% benefit)"
+                        : "";
+                    writer.WriteLine($"  [{item.Severity}] {item.Operator}{SourceTag(item.Source)}{legacyTag}{item.SuppressedTag}{benefitTag}: {EscapeNewlines(full)}");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Formats a memory value given in KB to a human-readable string.
+    /// Under 1,024 KB: show KB (e.g., "512 KB").
+    /// 1,024 KB to 1,048,576 KB: show MB with 1 decimal (e.g., "533.3 MB").
+    /// Over 1,048,576 KB: show GB with 2 decimals (e.g., "2.14 GB").
+    /// </summary>
+    public static string FormatMemoryGrantKB(long kb)
+    {
+        if (kb < 1024)
+            return $"{kb:N0} KB";
+        if (kb < 1024 * 1024)
+            return $"{kb / 1024.0:N1} MB";
+        return $"{kb / (1024.0 * 1024.0):N2} GB";
+    }
+
+    /// <summary>
+    /// Replaces newlines with unit separator (U+001F) so multi-line warning messages
+    /// survive the top-level line split in AdviceContentBuilder.Build().
+    /// CreateWarningBlock splits on U+001F to restore the internal structure.
+    /// </summary>
+    /// <summary>
+    /// #436: marks the warnings SQL Server itself put in the plan, so they read differently from our
+    /// inferences. Only the engine's are tagged — they are the minority and the ones carrying extra
+    /// authority, and tagging all of them would just be noise on every line.
+    /// </summary>
+    private static string SourceTag(string? source) =>
+        source == nameof(PlanViewer.Core.Models.PlanWarningSource.SqlServer) ? " [SQL Server]" : "";
+
+    /// <summary>The " [suppressed: reason]" tag for a finding a .planview.json suppression matched (#651).</summary>
+    private static string SuppressedTag(WarningResult w) =>
+        w.IsSuppressed
+            ? string.IsNullOrWhiteSpace(w.SuppressionReason)
+                ? " [suppressed]"
+                : $" [suppressed: {EscapeNewlines(w.SuppressionReason)}]"
+            : "";
+
+    private static string EscapeNewlines(string text) => text.Replace('\n', '\x1F');
+
+    private static void CollectNodeTimings(
+        OperatorResult node,
+        List<(OperatorResult Node, long OwnCpuMs, long OwnElapsedMs)> timings,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        // Skip exchanges — negligible own work, misleading elapsed times
+        if (node.PhysicalOp != "Parallelism")
+        {
+            // Own times come from the analyzer (PlanAnalyzer.Timing), which works per thread,
+            // looks through pass-through operators and subtracts whole batch zones. The row-mode
+            // subtraction that used to live here took only a batch child's own time, so a
+            // Stream Aggregate over a batch Sort was charged the Sort's whole subtree.
+            var ownCpu = node.OwnCpuMs ?? 0;
+            var ownElapsed = node.OwnElapsedMs ?? 0;
+
+            // When CPU data is available, only include operators that did real CPU work.
+            // Row-mode elapsed with 0 CPU is a cumulative timing artifact, not real work.
+            if (node.ActualCpuMs.HasValue)
+            {
+                if (ownCpu > 0)
+                    timings.Add((node, ownCpu, ownElapsed));
+            }
+            else if (ownElapsed > 0)
+            {
+                // No CPU data (estimated plans) — fall back to elapsed only
+                timings.Add((node, 0, ownElapsed));
+            }
+        }
+
+        foreach (var child in node.Children)
+            CollectNodeTimings(child, timings, cancellationToken);
+    }
+
+}

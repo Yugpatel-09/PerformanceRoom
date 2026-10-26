@@ -1,0 +1,590 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Input.Platform;
+using Avalonia.Interactivity;
+using Avalonia.Layout;
+using Avalonia.LogicalTree;
+using Avalonia.Media;
+using AvaloniaEdit;
+using AvaloniaEdit.CodeCompletion;
+using AvaloniaEdit.TextMate;
+using Microsoft.Data.SqlClient;
+using PlanViewer.App.Dialogs;
+using PlanViewer.App.Helpers;
+using PlanViewer.App.Services;
+using PlanViewer.Core.Interfaces;
+using PlanViewer.Core.Models;
+using PlanViewer.Core.Output;
+using PlanViewer.Core.Services;
+using TextMateSharp.Grammars;
+
+namespace PlanViewer.App.Controls;
+
+public partial class QuerySessionControl : UserControl
+{
+    private bool AddPlanTab(string planXml, string queryText, bool estimated, string? labelOverride = null)
+        => AddPlanTab(planXml, queryText, estimated, labelOverride, sourceDatabase: null, out _);
+
+    private bool AddPlanTab(string planXml, string queryText, bool estimated, string? labelOverride, out string? failure)
+        => AddPlanTab(planXml, queryText, estimated, labelOverride, sourceDatabase: null, out failure);
+
+    /// <summary>
+    /// Points a plan viewer hosted in this session at the database its plan came from:
+    /// <paramref name="sourceDatabase"/> when a Query Store grid supplied one, the toolbar's when
+    /// not. The viewer's schema lookups (Show Indexes, Show Table Definition) run on its
+    /// ConnectionString and its status label names the database, so both follow the plan rather
+    /// than whatever the toolbar shows (E1).
+    /// </summary>
+    private void ConnectViewer(PlanViewerControl viewer, string? sourceDatabase)
+    {
+        viewer.SourceDatabase = sourceDatabase;
+        viewer.ConnectionString = sourceDatabase != null && _serverConnection != null
+            ? _serverConnection.GetConnectionString(_credentialService, sourceDatabase)
+            : _connectionString;
+        viewer.SetConnectionServices(_credentialService, _connectionStore);
+        if (_serverConnection != null)
+            viewer.SetConnectionStatus(_serverConnection.ServerName, sourceDatabase ?? _selectedDatabase);
+    }
+
+    /// <param name="sourceDatabase">
+    /// The database this plan came from, when that is a Query Store grid's own picker rather
+    /// than the toolbar's — null for every other path. See <see cref="ConnectViewer"/> and
+    /// <see cref="PlanViewerControl.SourceDatabase"/> for why (E1).
+    /// </param>
+    private bool AddPlanTab(string planXml, string queryText, bool estimated, string? labelOverride,
+        string? sourceDatabase, out string? failure)
+    {
+        failure = null;
+        _planCounter++;
+        var label = labelOverride ?? (estimated ? $"Est Plan {_planCounter}" : $"Plan {_planCounter}");
+
+        var viewer = new PlanViewerControl();
+        // Sub-tab of this session: the session's toolbar above it owns the connection (#U5).
+        viewer.HostedInSession = true;
+        viewer.Metadata = _serverMetadata;
+        ConnectViewer(viewer, sourceDatabase);
+        viewer.OpenInEditorRequested += OnOpenInEditorRequested;
+
+        if (!viewer.LoadPlan(planXml, label, queryText))
+        {
+            // Blank XML or a parse failure. Don't navigate away from the current view
+            // (e.g. the Query Store grid) to a blank tab — surface why and stay put.
+            viewer.OpenInEditorRequested -= OnOpenInEditorRequested;
+            failure = $"Couldn't load {label}: {viewer.LastLoadError}";
+            SetErrorStatus(failure);
+            return false;
+        }
+
+        var tab = NewPlanTab(label, viewer);
+
+        AddDocument(tab);
+        SelectDocument(tab);
+        return true;
+    }
+
+    /// <summary>
+    /// The tab a plan document lives in: its label, its close button, and the right-click menu.
+    /// </summary>
+    /// <remarks>
+    /// Said once because three paths open plan documents - this one, and the two execute paths in
+    /// the execution partial - and only this one ever built the menu. A tab built without it has no
+    /// Rename, no Close Other Tabs and no Close All at all, and nothing says so: the header looks
+    /// identical either way, so the first anyone hears of it is a right-click that does nothing.
+    /// Executing a query is the commonest way to open a plan, which made the menu missing exactly
+    /// where it was most expected. Handing back a finished tab, rather than a header each caller
+    /// decorates, is what stops a fourth path forgetting again.
+    /// </remarks>
+    private TabItem NewPlanTab(string label, Control content)
+    {
+        var headerText = new TextBlock
+        {
+            Text = label,
+            VerticalAlignment = VerticalAlignment.Center,
+            FontSize = 12
+        };
+
+        var closeBtn = new Button
+        {
+            Content = "✕",
+            MinWidth = 22,
+            MinHeight = 22,
+            Width = 22,
+            Height = 22,
+            Padding = new Avalonia.Thickness(0),
+            FontSize = 11,
+            Margin = new Avalonia.Thickness(6, 0, 0, 0),
+            Background = Brushes.Transparent,
+            BorderThickness = new Avalonia.Thickness(0),
+            Foreground = ForegroundToken,
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center
+        };
+
+        var header = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            /* Not decoration: a null-background panel hit-tests only its children's pixels, so a
+               right-click in the gap between the label's glyphs and the close button falls through
+               to the TabItem, which has no menu of its own. Transparent makes the whole header rect
+               a target, which is what CreateSubTab's header already does. */
+            Background = Brushes.Transparent,
+            Children = { headerText, closeBtn }
+        };
+
+        var tab = new TabItem { Header = header, Content = content };
+        closeBtn.Tag = tab;
+        closeBtn.Click += ClosePlanTab_Click;
+
+        var contextMenu = new ContextMenu
+        {
+            Items =
+            {
+                new MenuItem { Header = "Rename Tab", Tag = new object[] { header, headerText } },
+                new Separator(),
+                /* Ctrl+F4, not the Ctrl+W this label used to refuse to show. Ctrl+W stays the
+                   window's: its tunnel handler claims that keystroke whenever a top-level tab is
+                   selected, which is always, and closes the whole session - so a Ctrl+W label here
+                   would have been a lie the user discovers by losing everything they had open.
+                   F4 has no tunnel case, so it reaches the session's own handler, where it closes
+                   exactly this document. The gesture is display-only in Avalonia: the binding that
+                   makes it true lives in OnKeyDown, and the two only ever change together. */
+                new MenuItem
+                {
+                    Header = "Close",
+                    Tag = tab,
+                    InputGesture = new KeyGesture(Key.F4, KeyModifiers.Control)
+                },
+                new MenuItem { Header = "Close Other Tabs", Tag = tab },
+                new MenuItem { Header = "Close All Tabs" }
+            }
+        };
+
+        foreach (var item in contextMenu.Items.OfType<MenuItem>())
+            item.Click += PlanTabContextMenu_Click;
+
+        header.ContextMenu = contextMenu;
+
+        return tab;
+    }
+
+    private void StartRename(StackPanel header, TextBlock headerText)
+    {
+        var textBox = new TextBox
+        {
+            Text = headerText.Text,
+            FontSize = 12,
+            MinWidth = 80,
+            Padding = new Avalonia.Thickness(2, 0),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        headerText.IsVisible = false;
+        header.Children.Insert(0, textBox);
+        textBox.Focus();
+        textBox.SelectAll();
+
+        void CommitRename()
+        {
+            var newName = textBox.Text?.Trim();
+            if (!string.IsNullOrEmpty(newName))
+                headerText.Text = newName;
+
+            headerText.IsVisible = true;
+            header.Children.Remove(textBox);
+        }
+
+        textBox.KeyDown += (_, ke) =>
+        {
+            if (ke.Key == Key.Enter || ke.Key == Key.Escape)
+            {
+                if (ke.Key == Key.Escape)
+                    textBox.Text = headerText.Text;
+                CommitRename();
+                ke.Handled = true;
+            }
+        };
+
+        textBox.LostFocus += (_, _) => CommitRename();
+    }
+
+    /// <summary>
+    /// Closes one document: lets go of whatever it was holding, then takes it out of the strip.
+    /// </summary>
+    /// <remarks>
+    /// Said once because there are four doors onto it — the header's ✕, the context menu's Close,
+    /// its two bulk siblings, and Ctrl+F4 — and the release half is the half that goes missing.
+    /// A plan viewer holds an MCP session registration that nothing else unregisters, so a close
+    /// that only removes the tab leaks it, invisibly and for the life of the process. The ✕ that
+    /// <see cref="CreateSubTab"/> builds for Query Store and History documents goes through here
+    /// too, so what each kind gives up is decided in <see cref="ReleaseDocument"/> and nowhere else.
+    /// </remarks>
+    private void CloseDocument(TabItem tab)
+    {
+        ReleaseDocument(tab);
+        RemoveDocument(tab);
+    }
+
+    /// <summary>
+    /// Gives up what one document holds, and leaves it in the strip.
+    /// </summary>
+    /// <remarks>
+    /// Said once so that closing one document and closing the whole session release the same
+    /// things: <see cref="CloseDocument"/> calls it for the document it is closing, and
+    /// <see cref="ReleaseOnClose"/> calls it for every document the session still holds. It reads
+    /// the tab's content as it is NOW, so a tab that started as a spinner and had a plan swapped
+    /// into it is released as the plan viewer it became.
+    ///
+    /// <para>What each kind holds: a plan viewer holds its MCP session registration, a Query Store
+    /// grid and a History document hold a fetch running on the server, and a loading tab holds the
+    /// run that will fill it. Closing the tab stops all of them, because none of them has anywhere
+    /// left to put what it was fetching.</para>
+    ///
+    /// <para>Safe to call twice on the same document: unregistering a plan that is already gone,
+    /// and cancelling a source that is already cancelled, both do nothing.</para>
+    /// </remarks>
+    private void ReleaseDocument(TabItem tab)
+    {
+        switch (tab.Content)
+        {
+            case PlanViewerControl viewer:
+                viewer.Clear();
+                break;
+
+            case QueryStoreGridControl grid:
+                grid.CancelFetch();
+                break;
+
+            case QueryStoreHistoryControl history:
+                history.CancelFetch();
+                break;
+        }
+
+        if (_tabRuns.TryGetValue(tab, out var run))
+            run.Cancel();
+    }
+
+    /// <summary>
+    /// The session's tab has been closed for good: releases every document it still holds, and
+    /// stops the work the session itself has running.
+    /// </summary>
+    /// <remarks>
+    /// Called by the window that owns the tab, after the tab has left the strip or the detached
+    /// window has closed. Not called on a detach or a re-dock, where the session moves and stays
+    /// open. Closing a session used to remove its tab and nothing else: every plan viewer in it
+    /// stayed registered with the MCP session manager until the app exited, and a query or plan
+    /// capture (both run with no timeout) kept running on the server for a session nobody could
+    /// see any more.
+    ///
+    /// <para>The current run is cancelled here directly, as well as through the loading tab that
+    /// shows it: the session's current source is the one thing a close must never leave live,
+    /// whatever state its tab is in. Starting a run cancels the one before it, so it is also the
+    /// only source that can still be live. The metadata fetch behind the database picker belongs
+    /// to the session too.</para>
+    /// </remarks>
+    internal void ReleaseOnClose()
+    {
+        _executionCts?.Cancel();
+        _databaseMetadataCts?.Cancel();
+
+        foreach (var tab in DocumentTabs.ToList())
+            ReleaseDocument(tab);
+    }
+
+    private void ClosePlanTab_Click(object? sender, RoutedEventArgs e)
+    {
+        if (sender is Button btn && btn.Tag is TabItem tab)
+            CloseDocument(tab);
+    }
+
+    private void PlanTabContextMenu_Click(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem item) return;
+
+        switch (item.Header?.ToString())
+        {
+            case "Rename Tab":
+                if (item.Tag is object[] parts)
+                    StartRename((StackPanel)parts[0], (TextBlock)parts[1]);
+                break;
+
+            case "Close":
+                if (item.Tag is TabItem tab)
+                    CloseDocument(tab);
+                break;
+
+            case "Close Other Tabs":
+                if (item.Tag is TabItem keepTab)
+                {
+                    // Keep the selected tab; the editor is not this menu's to close
+                    var others = DocumentTabs
+                        .Where(t => t != keepTab && t.Content is PlanViewerControl)
+                        .ToList();
+                    foreach (var t in others)
+                        CloseDocument(t);
+                    SelectDocument(keepTab);
+                }
+                break;
+
+            case "Close All Tabs":
+                var planTabs = DocumentTabs
+                    .Where(t => t.Content is PlanViewerControl)
+                    .ToList();
+                foreach (var t in planTabs)
+                    CloseDocument(t);
+                SelectEditor();
+                break;
+        }
+    }
+
+    /// <summary>
+    /// #447: asks the window, not this session. Comparing the plan from one query against the plan
+    /// from another is the ordinary case, and counting only this session's own tabs left the button
+    /// disabled in both — the reporter had to save a plan and reopen it to get at a comparison the
+    /// app could already do.
+    ///
+    /// <para>Called by the <see cref="TabContentWatcher"/> wired to this session's sub-tabs, and by
+    /// <see cref="MainWindow.DetachTabToWindow"/> when this session leaves the tab strip — the
+    /// watcher only fires on sub-tab changes, and detaching changes none, so without that call the
+    /// button froze at whatever the window-wide count last said until the next plan landed. It used
+    /// to be called by hand at the five places that add or remove a plan tab, which is why the
+    /// paths that instead fill in an existing tab — every executed query — never reached it.</para>
+    /// </summary>
+    internal void UpdateCompareButtonState()
+    {
+        /* Logical tree, not TopLevel.GetTopLevel. A TabControl realises the selected tab's content
+           and nothing else, so a session sitting in a background tab has no visual root and cannot
+           see its own window — and a query started in one tab and left to run while the user works
+           in another lands its plan in exactly that state. GetTopLevel returned null there and the
+           fallback below silently reinstated the bug this method exists to fix. The logical parent
+           chain holds whether the tab is on screen or not. */
+        if (this.FindLogicalAncestorOfType<MainWindow>() is { } owner)
+        {
+            /* Refreshes every session, not just this one: a plan appearing here can be the second
+               plan that makes Compare available over THERE. */
+            owner.RefreshComparePlanAvailability();
+            return;
+        }
+
+        /* No owning window — the control is being hosted somewhere else or is not attached yet.
+           Fall back to what this session can see rather than leaving the button in a stale state. */
+        SetCompareAvailability(CountOwnPlans() >= 2);
+    }
+
+    internal void SetCompareAvailability(bool enabled) =>
+        Helpers.ComparePlansButtonState.Apply(ComparePlansButton, enabled);
+
+    private int CountOwnPlans()
+    {
+        int planCount = 0;
+        foreach (var t in DocumentTabs)
+        {
+            if (t.Content is PlanViewerControl v && v.CurrentPlan != null)
+                planCount++;
+        }
+        return planCount;
+    }
+
+    private static string GetTabLabel(TabItem tab)
+    {
+        if (tab.Header is StackPanel sp && sp.Children.Count > 0 && sp.Children[0] is TextBlock tb)
+            return tb.Text ?? "Plan";
+        if (tab.Header is string s)
+            return s;
+        return "Plan";
+    }
+
+    private void ComparePlans_Click(object? sender, RoutedEventArgs e)
+    {
+        /* #447: hand off to the window's picker, which lists plans from every session and labels
+           them "Query 1 > Plan". This session's own picker cannot see the other query's plan, which
+           is the whole complaint. */
+        if (TopLevel.GetTopLevel(this) is MainWindow owner)
+        {
+            owner.ShowCompareDialog();
+            return;
+        }
+
+        var planTabs = GetPlanTabs().ToList();
+        if (planTabs.Count < 2)
+        {
+            SetErrorStatus("Need at least 2 plans open to compare");
+            return;
+        }
+
+        ShowComparePickerDialog(planTabs);
+    }
+
+    private void ShowComparePickerDialog(List<(string label, PlanViewerControl viewer)> planTabs)
+    {
+        var items = planTabs.Select(t => t.label).ToList();
+
+        var comboA = new ComboBox
+        {
+            ItemsSource = items,
+            SelectedIndex = 0,
+            Width = 200,
+            Height = 28,
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(8, 0, 0, 0)
+        };
+
+        var comboB = new ComboBox
+        {
+            ItemsSource = items,
+            SelectedIndex = items.Count > 1 ? 1 : 0,
+            Width = 200,
+            Height = 28,
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(8, 0, 0, 0)
+        };
+
+        var compareBtn = new Button
+        {
+            Content = "Compare",
+            Height = 32,
+            Padding = new Avalonia.Thickness(16, 0),
+            FontSize = 12,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+
+        var cancelBtn = new Button
+        {
+            Content = "Cancel",
+            Height = 32,
+            Padding = new Avalonia.Thickness(16, 0),
+            FontSize = 12,
+            Margin = new Avalonia.Thickness(8, 0, 0, 0),
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            Theme = (Avalonia.Styling.ControlTheme)this.FindResource("AppButton")!
+        };
+
+        void UpdateCompareEnabled()
+        {
+            compareBtn.IsEnabled = comboA.SelectedIndex >= 0 && comboB.SelectedIndex >= 0
+                && comboA.SelectedIndex != comboB.SelectedIndex;
+        }
+
+        comboA.SelectionChanged += (_, _) => UpdateCompareEnabled();
+        comboB.SelectionChanged += (_, _) => UpdateCompareEnabled();
+        UpdateCompareEnabled();
+
+        var rowA = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Avalonia.Thickness(0, 0, 0, 8),
+            Children =
+            {
+                new TextBlock { Text = "Plan A:", VerticalAlignment = VerticalAlignment.Center, FontSize = 13, Width = 55 },
+                comboA
+            }
+        };
+
+        var rowB = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Children =
+            {
+                new TextBlock { Text = "Plan B:", VerticalAlignment = VerticalAlignment.Center, FontSize = 13, Width = 55 },
+                comboB
+            }
+        };
+
+        var buttonPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Margin = new Avalonia.Thickness(0, 16, 0, 0),
+            Children = { compareBtn, cancelBtn }
+        };
+
+        var content = new StackPanel
+        {
+            Margin = new Avalonia.Thickness(20),
+            Children =
+            {
+                new TextBlock { Text = "Select two plans to compare:", FontSize = 14, Margin = new Avalonia.Thickness(0, 0, 0, 12) },
+                rowA,
+                rowB,
+                buttonPanel
+            }
+        };
+
+        var dialog = new Window
+        {
+            Title = "Compare Plans",
+            Width = 380,
+            Height = 220,
+            MinWidth = 380,
+            MinHeight = 220,
+            Icon = GetParentWindow().Icon,
+            Background = BackgroundToken,
+            Foreground = ForegroundToken,
+            Content = content,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner
+        };
+
+        compareBtn.Click += (_, _) =>
+        {
+            var idxA = comboA.SelectedIndex;
+            var idxB = comboB.SelectedIndex;
+            if (idxA < 0 || idxB < 0 || idxA == idxB) return;
+
+            var (labelA, viewerA) = planTabs[idxA];
+            var (labelB, viewerB) = planTabs[idxB];
+
+            var analysisA = ResultMapper.Map(viewerA.CurrentPlan!, "query editor", _serverMetadata, viewerA.QueryText);
+            var analysisB = ResultMapper.Map(viewerB.CurrentPlan!, "query editor", _serverMetadata, viewerB.QueryText);
+
+            dialog.Close();
+            ComparisonWindow.Show(GetParentWindow(), analysisA, analysisB, labelA, labelB);
+        };
+
+        cancelBtn.Click += (_, _) => dialog.Close();
+
+        dialog.ShowDialog(GetParentWindow());
+    }
+
+    /// <summary>
+    /// Gets the PlanViewerControl for the currently selected plan tab, or null if
+    /// the Editor tab or no plan tab is selected.
+    /// </summary>
+    private PlanViewerControl? GetSelectedPlanViewer()
+    {
+        if (SelectedDocument is { Content: PlanViewerControl viewer } && viewer.CurrentPlan != null)
+        {
+            return viewer;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Enables or disables buttons that require a plan tab to be selected.
+    /// Called when the SubTabControl selection changes and after plan tabs are added/removed.
+    /// </summary>
+    private void UpdatePlanTabButtonState()
+    {
+        var hasPlanTab = GetSelectedPlanViewer() != null;
+        var hasConnection = _connectionString != null && _selectedDatabase != null;
+
+        CopyReproButton.IsEnabled = hasPlanTab;
+        GetActualPlanButton.IsEnabled = hasPlanTab && hasConnection;
+
+        // Advice buttons also depend on a plan being selected
+        HumanAdviceButton.IsEnabled = hasPlanTab;
+        RobotAdviceButton.IsEnabled = hasPlanTab;
+    }
+}

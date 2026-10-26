@@ -1,0 +1,454 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Avalonia.Controls;
+using Avalonia.Interactivity;
+using Avalonia.Media;
+using Avalonia.Threading;
+using PlanViewer.App.Helpers;
+using PlanViewer.App.Services;
+using PlanViewer.Core.Interfaces;
+using PlanViewer.Core.Models;
+using PlanViewer.Core.Services;
+
+namespace PlanViewer.App.Controls;
+
+public partial class QueryStoreOverviewControl : UserControl
+{
+    private readonly ServerConnection _serverConnection;
+    private readonly ICredentialService _credentialService;
+    /// <summary>
+    /// The offset holder of the connection this Overview was built on (E5). A reconnect throws the
+    /// Overview away and builds a new one (QuerySessionControl.InvalidateOverviewView), so this is
+    /// always the holder of the server whose data is on screen.
+    /// </summary>
+    private readonly ServerUtcOffset _serverOffset;
+    private readonly string _masterConnectionString;
+    private readonly int _maxDop;
+    private readonly int _topN;
+    private readonly bool _supportsWaitStats;
+    private CancellationTokenSource? _cts;
+
+    /// <summary>
+    /// The token source of the load or refresh that is running right now, or null when nothing is.
+    /// Set where <see cref="LoadAsync"/> and <see cref="OnSlicerRangeChanged"/> take the token over,
+    /// and cleared in their <c>finally</c> only if it is still theirs — read by the detach handler
+    /// so it knows whether cancelling is aborting real work or just tidying up an already-finished
+    /// token (<see cref="_cts"/> stays non-null after a load succeeds, so it cannot answer that on
+    /// its own).
+    ///
+    /// <para>By identity rather than a flag because the two overlap on every ordinary load: loading
+    /// the slicer raises RangeChanged, whose handler cancels the load's token and runs the long
+    /// metrics phase on a token of its own, while the cancelled load unwinds and reaches its
+    /// <c>finally</c> first. A flag cleared there would say nothing is running for the whole of
+    /// the slowest phase — exactly when a switch away is likeliest.</para>
+    /// </summary>
+    private CancellationTokenSource? _runningCts;
+
+    /// <summary>
+    /// The token of the load or refresh that started most recently, or a token that is never
+    /// cancelled when none has.
+    ///
+    /// <para>Read it straight after starting a load, not after awaiting one: <see cref="LoadAsync"/>
+    /// takes its token over before its first await, so at that moment it is that load's — and it
+    /// stays that load's after a later load replaces the field or a detach nulls it, which is what
+    /// lets a caller tell, once the load fails, whether it failed or was cancelled (#628).</para>
+    /// </summary>
+    internal CancellationToken LoadToken => _cts?.Token ?? default;
+
+    /// <summary>
+    /// Set when a detach cancelled a load that was still running — the load the user would have
+    /// seen finish if they had not switched away. Consumed by the next attach, which restarts it
+    /// with the same time range; a load that had already finished never sets this, so coming back
+    /// to a view that is already showing its data does not reload it for nothing (E3).
+    /// </summary>
+    private bool _reloadOnAttach;
+
+    private List<DatabaseQueryStoreState> _states = new();
+    private List<DatabaseMetrics> _metrics = new();
+    private List<DatabaseTimeSlice> _timeSlices = new();
+    private List<DatabaseWaitAmountTimeSlice> _waitSlices = new();
+    private List<string> _activeDbs = new();
+
+    private DateTime _slicerStartUtc;
+    private DateTime _slicerEndUtc;
+    private int _daysBack = 30;
+
+    // Color palette for databases — loaded from user settings
+    private readonly Color[] _palette;
+
+    /* Resolved from the theme token; the literal is the token's own value as lookup-miss
+       insurance - the same pattern AdviceContentBuilder uses for its status brushes. */
+    private static readonly Color OthersColor =
+        Avalonia.Application.Current?.TryGetResource("QsOthersColor", null, out var othersColor) == true
+            && othersColor is Color qsOthers
+            ? qsOthers
+            : Color.Parse("#555555");
+
+    /// <summary>
+    /// Which half of every metric card is on show. The dashboard used to render both: a Total row
+    /// of seven cards and an Avg row of the same seven underneath it, fourteen near-identical
+    /// stacks of pills. They are one row now, and this is the switch.
+    /// </summary>
+    private bool _showAverages;
+
+    public class DrillDownEventArgs(string database, DateTime startUtc, DateTime endUtc) : EventArgs
+    {
+        public string Database { get; } = database;
+        public DateTime StartUtc { get; } = startUtc;
+        public DateTime EndUtc { get; } = endUtc;
+    }
+
+    public event EventHandler<DrillDownEventArgs>? DrillDownRequested;
+
+    public QueryStoreOverviewControl(ServerConnection serverConnection,
+        ICredentialService credentialService, ServerUtcOffset serverOffset,
+        int maxDop = 8, int? topN = null, bool supportsWaitStats = true)
+    {
+        _serverConnection = serverConnection;
+        _credentialService = credentialService;
+        _serverOffset = serverOffset;
+        _masterConnectionString = serverConnection.GetConnectionString(credentialService, "master");
+        _maxDop = maxDop;
+
+        var userSettings = AppSettingsService.Load();
+        _topN = topN ?? userSettings.MultiQsTopDbCount;
+        _palette = userSettings.MultiQsTopDbColors
+            .Select(hex => { try { return Color.Parse(hex); } catch { return Color.Parse("#555555"); } })
+            .ToArray();
+        if (_palette.Length == 0)
+            _palette = AppSettingsService.DefaultTopDbColors.Select(hex => Color.Parse(hex)).ToArray();
+
+        /* Settings clamp MultiQsTopDbCount at 20 and ship eight colours. Asking for twelve used to
+           paint databases nine through twelve in the same grey as the Others aggregate, in the
+           legend AND in all seven cards — which breaks the one promise the shared legend makes,
+           that a colour identifies a database everywhere. A database this palette cannot name
+           belongs in Others, where the grey means what it says. */
+        _topN = Math.Min(_topN, _palette.Length);
+
+        _supportsWaitStats = supportsWaitStats;
+        _slicerEndUtc = DateTime.UtcNow;
+        _slicerStartUtc = _slicerEndUtc.AddHours(-24);
+
+        InitializeComponent();
+
+        // Declared in XAML, so handed the holder here, before any data reaches it.
+        OverviewTimeSlicer.ServerOffset = serverOffset;
+
+        /* Only the wait stats chart is drawn into a Canvas at absolute coordinates, so it is the
+           only thing left that has to be redrawn when the control resizes. The state card and the
+           metric cards are laid out by the panels they live in and reflow on their own. */
+        this.SizeChanged += (_, _) => DrawWaitStatsChart();
+
+        OverviewTimeSlicer.RangeChanged += OnSlicerRangeChanged;
+
+        TotalModeToggle.IsCheckedChanged += OnMetricModeChanged;
+        AvgModeToggle.IsCheckedChanged += OnMetricModeChanged;
+
+        /* Cancel, never dispose — see OnSlicerRangeChanged for why. A redock, or a session closing
+           while a refresh is in flight, would otherwise dispose a token that refresh still holds,
+           and ObjectDisposedException is not what its caller is catching. */
+        this.DetachedFromVisualTree += (_, _) =>
+        {
+            /* A load left running is one the user would have seen land if they had not switched
+               away — remembered here so the next attach can pick it back up (E3). The claim is
+               dropped along with the token: what is cancelled next is about to unwind, and the
+               question for the next detach is only ever about work started since. */
+            _reloadOnAttach = _runningCts != null;
+            _runningCts = null;
+            _cts?.Cancel();
+            _cts = null;
+        };
+
+        /* The session detaches this control's whole host when the user switches to another
+           top-level tab (QuerySessionControl.axaml.cs) — switching the view's own segment does
+           not, ApplySurface only toggles IsVisible, so this never fires from that. Only the
+           detach above sets _reloadOnAttach, so an attach after a load that already finished,
+           failed, or was cancelled some other way restarts nothing. */
+        this.AttachedToVisualTree += async (_, _) =>
+        {
+            if (!_reloadOnAttach) return;
+            _reloadOnAttach = false;
+
+            var load = LoadAsync();
+            var run = LoadToken;
+
+            try
+            {
+                await load;
+            }
+            catch (Exception ex) when (CancellationHelper.IsCancellation(ex, run))
+            {
+                /* Superseded by yet another load before this one finished — that one reports — or
+                   cancelled by another detach. Either way not a failed refresh. The token decides,
+                   not the exception type: SqlClient reports a cancel that lands while the server is
+                   still running the query as a SqlException (#628). */
+            }
+            catch (Exception ex)
+            {
+                /* Nothing awaits this handler, so an escaped exception here has nowhere to go
+                   but the process — same reasoning as ShowOverviewCoreAsync's own catch
+                   (QuerySessionControl.Views.cs). The session may not even be looking at this
+                   view by the time it lands, which is exactly what this badge is for. */
+                ShowRefreshError(ex);
+            }
+        };
+    }
+
+    /// <summary>
+    /// Whether a load has ever got as far as putting data on the slicer.
+    /// </summary>
+    /// <remarks>
+    /// Until it has there is no range the user chose for the next load to preserve — including
+    /// after a load that failed, which is why a failure retries as a first load rather than
+    /// restoring a window nobody picked.
+    /// </remarks>
+    private bool _loaded;
+
+    public async Task LoadAsync()
+    {
+        _cts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _cts = cts;
+        _runningCts = cts;
+        var ct = cts.Token;
+
+        await Dispatcher.UIThread.InvokeAsync(() =>
+        {
+            LoadingBar.IsIndeterminate = true;
+            // A badge left over from the last attempt is not about this one.
+            ClearRefreshError();
+        });
+
+        try
+        {
+            // Phase 1: Get states
+            var states = await QueryStoreOverviewService.FetchAllStatesAsync(
+                _masterConnectionString, _maxDop, ct);
+
+            await Dispatcher.UIThread.InvokeAsync(() => ApplyStates(states));
+
+            // Phase 2: Get time slices for active databases (cache the list)
+            _activeDbs = _states
+                .Where(s => s.State == QueryStoreState.ReadWrite || s.State == QueryStoreState.ReadOnly)
+                .Select(s => s.DatabaseName).ToList();
+
+            if (_activeDbs.Count == 0) return;
+
+            _timeSlices = await QueryStoreOverviewService.FetchAllTimeSlicesAsync(
+                _masterConnectionString, _activeDbs, _daysBack, _maxDop, ct);
+
+            // Consolidate time slices across databases into QueryStoreTimeSlice for the slicer
+            var consolidated = _timeSlices
+                .GroupBy(s => s.IntervalStartUtc)
+                .Select(g => new QueryStoreTimeSlice
+                {
+                    IntervalStartUtc = g.Key,
+                    TotalCpu = g.Sum(x => x.TotalCpu),
+                    TotalDuration = g.Sum(x => x.TotalDuration),
+                    TotalReads = g.Sum(x => x.TotalReads),
+                    TotalWrites = g.Sum(x => x.TotalWrites),
+                    TotalPhysicalReads = g.Sum(x => x.TotalPhysicalReads),
+                    TotalMemory = g.Sum(x => x.TotalMemory),
+                    TotalExecutions = g.Sum(x => x.TotalExecutions),
+                })
+                .OrderBy(x => x.IntervalStartUtc)
+                .ToList();
+
+            /* Captured before LoadData, because LoadData resets the selection and raises
+               RangeChanged — and these two fields are what that handler writes.
+
+               Asking for this view always reloads it, which is the only way it ever refreshes: it
+               has no timer. So a reload has to keep the range the user dragged to, or coming back
+               to the view would quietly throw their window away and show the default again.
+               LoadData clamps whatever it is handed into the data it just fetched, so a range that
+               has since scrolled off the end comes back as the nearest one that exists. */
+            var previousStart = _loaded ? (DateTime?)_slicerStartUtc : null;
+            var previousEnd = _loaded ? (DateTime?)_slicerEndUtc : null;
+
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                OverviewTimeSlicer.LoadData(consolidated, "cpu", previousStart, previousEnd);
+                _loaded = true;
+            });
+
+            // Phase 3: Metrics and wait stats for selected time range
+            await RefreshMetricsAndWaitStatsAsync(ct);
+        }
+        catch (Exception ex) when (CancellationHelper.IsCancellation(ex, ct))
+        {
+            /* Not a failure, and not worth a word. The caller puts this control's outcome on the
+               session's status strip, where "A task was canceled." says nothing about which task —
+               and the thing that cancelled it is a later load already in flight, which will report
+               for itself. Loading the slicer is one of the cancellers: it raises RangeChanged,
+               whose handler takes the token over to run the same last phase.
+
+               The token decides, not the exception type. A cancel that lands while the server is
+               still running a query comes back from SqlClient as a SqlException ("Operation
+               cancelled by user."), not an OperationCanceledException, so it used to escape to the
+               caller and be shown as a failed refresh (#628). */
+        }
+        finally
+        {
+            /* Only if the claim is still this run's. Loading the slicer hands the token to
+               OnSlicerRangeChanged, so on the ordinary path this run unwinds while the refresh it
+               started is only beginning its slowest phase — and that refresh's claim is the one
+               that has to survive. */
+            if (ReferenceEquals(_runningCts, cts)) _runningCts = null;
+            await Dispatcher.UIThread.InvokeAsync(() => LoadingBar.IsIndeterminate = false);
+        }
+    }
+
+    private async Task RefreshMetricsAndWaitStatsAsync(CancellationToken ct)
+    {
+        if (_activeDbs.Count == 0) return;
+
+        await Dispatcher.UIThread.InvokeAsync(() => LoadingBar.IsIndeterminate = true);
+        try
+        {
+            var metrics = await QueryStoreOverviewService.FetchAllMetricsAsync(
+                _masterConnectionString, _activeDbs, _slicerStartUtc, _slicerEndUtc, _maxDop, ct);
+
+            if (_supportsWaitStats)
+            {
+                var (slices, errors) = await QueryStoreOverviewService.FetchAllWaitStatsWithErrorsAsync(
+                    _masterConnectionString, _activeDbs, _slicerStartUtc, _slicerEndUtc, _maxDop, ct);
+                _waitSlices = slices;
+
+                await Dispatcher.UIThread.InvokeAsync(() => UpdateWaitStatsWarning(errors));
+            }
+            else
+            {
+                _waitSlices.Clear();
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                    UpdateWaitStatsWarning(new List<(string Database, string Error)>()));
+            }
+
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                ApplyMetrics(metrics);
+                DrawWaitStatsChart();
+            });
+        }
+        finally
+        {
+            await Dispatcher.UIThread.InvokeAsync(() => LoadingBar.IsIndeterminate = false);
+        }
+    }
+
+    /// <summary>
+    /// Takes a fetched set of Query Store states and redraws the state card from it.
+    ///
+    /// <para>This and <see cref="ApplyMetrics"/> are the two seams between "we asked a server" and
+    /// "we drew something". The load path above calls them after each fetch; the tests call them
+    /// with hand-built rows, which is the only way to exercise the drawing without standing up a
+    /// SQL Server and inheriting its timeouts.</para>
+    /// </summary>
+    internal void ApplyStates(List<DatabaseQueryStoreState> states)
+    {
+        _states = states;
+        DrawStatesCard();
+    }
+
+    /// <summary>
+    /// Takes a fetched set of per-database metrics and redraws the legend and the metric cards.
+    /// </summary>
+    internal void ApplyMetrics(List<DatabaseMetrics> metrics)
+    {
+        _metrics = metrics;
+        DrawBarCards();
+    }
+
+    /// <summary>
+    /// Both segments raise this — one as it clears, one as it sets — so the guard is what keeps a
+    /// single click from rebuilding seven cards twice.
+    /// </summary>
+    private void OnMetricModeChanged(object? sender, RoutedEventArgs e)
+    {
+        var showAverages = AvgModeToggle.IsChecked == true;
+        if (showAverages == _showAverages) return;
+
+        _showAverages = showAverages;
+        DrawBarCards();
+    }
+
+    private void UpdateWaitStatsWarning(List<(string Database, string Error)> errors)
+    {
+        if (errors.Count == 0)
+        {
+            WaitStatsWarning.IsVisible = false;
+            ToolTip.SetTip(WaitStatsWarning, null);
+            return;
+        }
+
+        var header = errors.Count == 1
+            ? "Wait stats incomplete (1 error):"
+            : $"Wait stats incomplete ({errors.Count} errors):";
+        var msg = string.Join("\n", errors.Select(e => $"[{e.Database}] {e.Error}"));
+
+        ToolTip.SetTip(WaitStatsWarning, $"{header}\n{msg}");
+        ToolTip.SetShowDelay(WaitStatsWarning, 200);
+        WaitStatsWarning.IsVisible = true;
+    }
+
+    // ── Time Slicer (delegates to TimeRangeSlicerControl) ──────────────────
+
+    private async void OnSlicerRangeChanged(object? sender, TimeRangeChangedEventArgs e)
+    {
+        _slicerStartUtc = e.StartUtc;
+        _slicerEndUtc = e.EndUtc;
+
+        // Don't dispose the previous CTS — the in-flight refresh still holds its token.
+        // Cancel signals the previous run; GC reclaims the source after both runs unwind.
+        // This is the control's rule, not this site's: LoadAsync and the detach handler cancel
+        // the same way, because a create-once view means any of the three can be the one that
+        // pulls the source out from under a run that is still using it.
+        _cts?.Cancel();
+        var newCts = new CancellationTokenSource();
+        _cts = newCts;
+        _runningCts = newCts;
+
+        ClearRefreshError();
+        try
+        {
+            await RefreshMetricsAndWaitStatsAsync(newCts.Token);
+        }
+        catch (Exception ex) when (CancellationHelper.IsCancellation(ex, newCts.Token))
+        {
+            // Superseded or detached: no "Last refresh failed" badge for a cancel (#628).
+        }
+        catch (Exception ex)
+        {
+            ShowRefreshError(ex);
+        }
+        finally
+        {
+            if (ReferenceEquals(_runningCts, newCts)) _runningCts = null;
+        }
+    }
+
+    /// <summary>
+    /// Puts a failure on the control's own badge rather than on a status strip somewhere above it.
+    /// </summary>
+    /// <remarks>
+    /// Internal because the session needs it too: a load started from the Overview keeps running
+    /// after the user has looked at something else, and its failure belongs here — beside the data
+    /// it is about, waiting for them to come back — rather than on a strip that is now describing a
+    /// completely different view.
+    /// </remarks>
+    internal void ShowRefreshError(Exception ex)
+    {
+        ToolTip.SetTip(RefreshErrorBadge, $"Last refresh failed:\n{ex.Message}");
+        ToolTip.SetShowDelay(RefreshErrorBadge, 200);
+        RefreshErrorBadge.IsVisible = true;
+    }
+
+    private void ClearRefreshError()
+    {
+        RefreshErrorBadge.IsVisible = false;
+        ToolTip.SetTip(RefreshErrorBadge, null);
+    }
+
+}

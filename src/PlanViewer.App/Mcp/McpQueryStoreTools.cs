@@ -1,0 +1,389 @@
+using System;
+using System.ComponentModel;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using System.Text.Json;
+using System.Threading.Tasks;
+using ModelContextProtocol.Server;
+using PlanViewer.App.Services;
+using PlanViewer.Core.Interfaces;
+using PlanViewer.Core.Models;
+using PlanViewer.Core.Output;
+using PlanViewer.Core.Services;
+
+#pragma warning disable CA1707 // Identifiers should not contain underscores (MCP snake_case convention)
+
+namespace PlanViewer.App.Mcp;
+
+[McpServerToolType]
+public sealed class McpQueryStoreTools
+{
+    [McpServerTool(Name = "check_query_store")]
+    [Description("Checks whether Query Store is enabled and accessible on a database. " +
+        "Use this before calling get_query_store_top to verify the target database supports Query Store.")]
+    public static async Task<string> CheckQueryStore(
+        ConnectionStore connectionStore,
+        ICredentialService credentialService,
+        [Description("Server name from get_connections.")] string connection_name,
+        [Description("Database name to check.")] string database,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            var conn = FindConnection(connectionStore, connection_name);
+            if (conn == null)
+                return ConnectionNotFound(connectionStore, connection_name);
+
+            var connectionString = conn.GetConnectionString(credentialService, database);
+            var (enabled, state, readOnlyReplica) = await QueryStoreService
+                .CheckEnabledAsync(connectionString, cancellationToken)
+                .ConfigureAwait(false);
+
+            return JsonSerializer.Serialize(new
+            {
+                server = conn.ServerName,
+                database,
+                query_store_enabled = enabled,
+                state,
+                read_only_replica = readOnlyReplica
+            }, McpHelpers.JsonOptions);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (cancellationToken.IsCancellationRequested)
+        {
+            /* The client cancelled the call, so there is nothing to report to it. SqlClient reports
+               a cancel that lands while the server is still running the query as a SqlException
+               ("Operation cancelled by user."), not an OperationCanceledException, so it would be
+               returned below as a failure (#628). */
+            throw new OperationCanceledException(ex.Message, ex, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            return McpHelpers.FormatError("check_query_store", ex);
+        }
+    }
+
+    [McpServerTool(Name = "get_query_store_top")]
+    [Description("Fetches the top N queries from Query Store ranked by the specified metric. " +
+        "Uses the application's built-in Query Store query — no arbitrary SQL is executed. " +
+        "Each fetched plan is automatically loaded into the application for further analysis " +
+        "with analyze_plan, get_plan_warnings, etc. Returns summary stats and session IDs. " +
+        "Optional filters narrow results server-side by query_id, plan_id, query_hash, " +
+        "plan_hash, module name (schema.name, supports % wildcards), query text (query_text_search / query_text_search_not), " +
+        "minimum execution count or average duration/CPU thresholds, execution type, and query-id / plan-id include/ignore lists.")]
+    public static async Task<string> GetQueryStoreTop(
+        PlanSessionManager sessionManager,
+        PlanOperations operations,
+        ConnectionStore connectionStore,
+        ICredentialService credentialService,
+        [Description("Server name from get_connections.")] string connection_name,
+        [Description("Database name to query.")] string database,
+        CancellationToken cancellationToken,
+        [Description("Number of top queries to return. Default 10, max 50.")] int top = 10,
+        [Description("Ranking metric: cpu, avg-cpu, duration, avg-duration, reads, avg-reads, " +
+            "writes, avg-writes, physical-reads, avg-physical-reads, memory, avg-memory, executions. " +
+            "Default: cpu.")] string order_by = "cpu",
+        [Description("Hours of history to include. Default 24, max 168.")] int hours_back = 24,
+        [Description("Filter by Query Store query ID.")] long? query_id = null,
+        [Description("Filter by Query Store plan ID.")] long? plan_id = null,
+        [Description("Filter by query hash (hex, e.g. 0x1AB2C3D4).")] string? query_hash = null,
+        [Description("Filter by query plan hash (hex, e.g. 0x1AB2C3D4).")] string? plan_hash = null,
+        [Description("Filter by module name (schema.name, supports % wildcards).")] string? module = null,
+        [Description("Filter to queries whose SQL text contains this string. Matched with SQL LIKE (auto-wrapped in %); % _ [ ] act as wildcards.")] string? query_text_search = null,
+        [Description("Exclude queries whose SQL text contains this string. Matched with SQL LIKE (auto-wrapped in %); % _ [ ] act as wildcards. Inverse of query_text_search.")] string? query_text_search_not = null,
+        [Description("When true, treat [ ] _ in query_text_search / query_text_search_not as literal characters instead of LIKE wildcards. Default false.")] bool escape_brackets = false,
+        [Description("Filter by execution type: regular, aborted, exception, or failed (= aborted + exception).")] string? execution_type = null,
+        [Description("Only include plans executed at least this many times (the plan's total execution count over the selected time window). Values <= 0 mean no filter.")] long? min_executions = null,
+        [Description("Only include plans whose average duration per execution over the selected time window is at least this many milliseconds. Values <= 0 mean no filter.")] long? min_duration_ms = null,
+        [Description("Only include plans whose average CPU time per execution over the selected time window is at least this many milliseconds. Values <= 0 mean no filter.")] long? min_cpu_ms = null,
+        [Description("Comma-separated Query Store query IDs to include, e.g. \"123,456\". Only these query IDs are returned.")] string? include_query_ids = null,
+        [Description("Comma-separated Query Store query IDs to exclude, e.g. \"123,456\".")] string? ignore_query_ids = null,
+        [Description("Comma-separated Query Store plan IDs to include, e.g. \"12,34\".")] string? include_plan_ids = null,
+        [Description("Comma-separated Query Store plan IDs to exclude, e.g. \"12,34\".")] string? ignore_plan_ids = null)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            var conn = FindConnection(connectionStore, connection_name);
+            if (conn == null)
+                return ConnectionNotFound(connectionStore, connection_name);
+
+            // Validate parameters
+            if (top < 1 || top > 50)
+                return "Invalid top value. Must be between 1 and 50.";
+            if (hours_back < 1 || hours_back > 168)
+                return "Invalid hours_back value. Must be between 1 and 168.";
+
+            string[]? executionTypes;
+            long[]? includeQueryIds;
+            long[]? ignoreQueryIds;
+            long[]? includePlanIds;
+            long[]? ignorePlanIds;
+            try
+            {
+                executionTypes = QueryStoreFilter.ParseExecutionType(execution_type);
+                includeQueryIds = QueryStoreFilter.ParseIdList(include_query_ids);
+                ignoreQueryIds = QueryStoreFilter.ParseIdList(ignore_query_ids);
+                includePlanIds = QueryStoreFilter.ParseIdList(include_plan_ids);
+                ignorePlanIds = QueryStoreFilter.ParseIdList(ignore_plan_ids);
+            }
+            catch (ArgumentException ex)
+            {
+                return ex.Message;
+            }
+
+            QueryStoreFilter? filter = null;
+            if (query_id != null || plan_id != null ||
+                query_hash != null || plan_hash != null || module != null || query_text_search != null ||
+                executionTypes != null ||
+                query_text_search_not != null || min_executions != null || min_duration_ms != null || min_cpu_ms != null ||
+                includeQueryIds != null || ignoreQueryIds != null || includePlanIds != null || ignorePlanIds != null)
+            {
+                filter = new QueryStoreFilter
+                {
+                    QueryId = query_id,
+                    PlanId = plan_id,
+                    QueryHash = query_hash,
+                    QueryPlanHash = plan_hash,
+                    ModuleName = module,
+                    QueryTextSearch = query_text_search,
+                    QueryTextSearchNot = query_text_search_not,
+                    EscapeBrackets = escape_brackets,
+                    ExecutionTypeDescs = executionTypes,
+                    MinExecutions = min_executions,
+                    MinDurationMs = min_duration_ms,
+                    MinCpuMs = min_cpu_ms,
+                    IncludeQueryIds = includeQueryIds,
+                    IgnoreQueryIds = ignoreQueryIds,
+                    IncludePlanIds = includePlanIds,
+                    IgnorePlanIds = ignorePlanIds,
+                };
+            }
+
+            var connectionString = conn.GetConnectionString(credentialService, database);
+
+            // Check Query Store is enabled first
+            var (enabled, state, readOnlyReplica) = await QueryStoreService
+                .CheckEnabledAsync(connectionString, cancellationToken)
+                .ConfigureAwait(false);
+            if (!enabled)
+                return readOnlyReplica
+                    ? $"[{database}] is a read-only replica with no Query Store data to read (state: {state ?? "unknown"}). Enable Query Store on the primary replica."
+                    : $"Query Store is not enabled on [{database}]. State: {state ?? "unknown"}.";
+
+            // Fetch plans using the app's built-in query
+            var plans = await QueryStoreService.FetchTopPlansAsync(
+                connectionString,
+                top,
+                order_by,
+                hours_back,
+                filter,
+                cancellationToken).ConfigureAwait(false);
+
+            if (plans.Count == 0)
+                return $"No Query Store data found in [{database}] for the last {hours_back} hours.";
+
+            // Fetch server metadata for Rule 38 (Standard Edition DOP limitation)
+            ServerMetadata? serverMetadata = null;
+            try
+            {
+                var isAzure = conn.ServerName.Contains(".database.windows.net", StringComparison.OrdinalIgnoreCase) ||
+                              conn.ServerName.Contains(".database.azure.com", StringComparison.OrdinalIgnoreCase);
+                serverMetadata = await ServerMetadataService
+                    .FetchServerMetadataAsync(connectionString, isAzure, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                // Non-fatal: analysis continues without server context
+            }
+
+            // Parse and register each plan with PlanSessionManager
+            var results = plans.Select(qsPlan =>
+            {
+                var sessionId = Guid.NewGuid().ToString();
+                var label = $"QS:{database} Q{qsPlan.QueryId} P{qsPlan.PlanId}";
+
+                try
+                {
+                    var xml = qsPlan.PlanXml
+                        .Replace("encoding=\"utf-16\"", "encoding=\"utf-8\"");
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var parsed = PlanAnalysisPipeline.Analyze(
+                        xml,
+                        AnalyzerConfig.Default,
+                        serverMetadata,
+                        cancellationToken);
+                    /* #589: a plan the parser refuses, such as one past the depth limit, comes
+                       back with ParseError set and no statements. Report it in load_error, not
+                       as a loaded plan with no warnings. */
+                    if (!string.IsNullOrWhiteSpace(parsed.ParseError))
+                        throw new InvalidOperationException($"Could not parse plan XML: {parsed.ParseError}");
+                    var session = CaptureSession(
+                        sessionId,
+                        label,
+                        parsed,
+                        qsPlan.QueryText,
+                        conn.ServerName);
+                    operations.AdmitSnapshot(
+                        session,
+                        Encoding.UTF8.GetByteCount(xml),
+                        cancellationToken);
+
+                    return new
+                    {
+                        session_id = sessionId,
+                        query_id = qsPlan.QueryId,
+                        plan_id = qsPlan.PlanId,
+                        query_hash = qsPlan.QueryHash,
+                        query_plan_hash = qsPlan.QueryPlanHash,
+                        module_name = string.IsNullOrEmpty(qsPlan.ModuleName) ? (string?)null : qsPlan.ModuleName,
+                        label,
+                        query_text = McpHelpers.Truncate(qsPlan.QueryText, 500),
+                        executions = qsPlan.CountExecutions,
+                        total_cpu_ms = qsPlan.TotalCpuTimeUs / 1000.0,
+                        avg_cpu_ms = qsPlan.AvgCpuTimeUs / 1000.0,
+                        total_duration_ms = qsPlan.TotalDurationUs / 1000.0,
+                        avg_duration_ms = qsPlan.AvgDurationUs / 1000.0,
+                        total_logical_reads = qsPlan.TotalLogicalIoReads,
+                        avg_logical_reads = qsPlan.AvgLogicalIoReads,
+                        warning_count = session.WarningCount,
+                        missing_index_count = session.MissingIndexCount,
+                        last_executed_utc = qsPlan.LastExecutedUtc.ToString("yyyy-MM-dd HH:mm:ss"),
+                        loaded = true,
+                        load_error = (string?)null
+                    };
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // Return bounded failure context without exposing a stack trace.
+                    return new
+                    {
+                        session_id = (string)"",
+                        query_id = qsPlan.QueryId,
+                        plan_id = qsPlan.PlanId,
+                        query_hash = qsPlan.QueryHash,
+                        query_plan_hash = qsPlan.QueryPlanHash,
+                        module_name = string.IsNullOrEmpty(qsPlan.ModuleName) ? (string?)null : qsPlan.ModuleName,
+                        label,
+                        query_text = McpHelpers.Truncate(qsPlan.QueryText, 500),
+                        executions = qsPlan.CountExecutions,
+                        total_cpu_ms = qsPlan.TotalCpuTimeUs / 1000.0,
+                        avg_cpu_ms = qsPlan.AvgCpuTimeUs / 1000.0,
+                        total_duration_ms = qsPlan.TotalDurationUs / 1000.0,
+                        avg_duration_ms = qsPlan.AvgDurationUs / 1000.0,
+                        total_logical_reads = qsPlan.TotalLogicalIoReads,
+                        avg_logical_reads = qsPlan.AvgLogicalIoReads,
+                        warning_count = 0,
+                        missing_index_count = 0,
+                        last_executed_utc = qsPlan.LastExecutedUtc.ToString("yyyy-MM-dd HH:mm:ss"),
+                        loaded = false,
+                        load_error = McpHelpers.Truncate(ex.Message, 512)
+                    };
+                }
+            }).ToList();
+
+            return JsonSerializer.Serialize(new
+            {
+                server = conn.ServerName,
+                database,
+                order_by,
+                hours_back,
+                plan_count = results.Count,
+                plans = results
+            }, McpHelpers.JsonOptions);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (cancellationToken.IsCancellationRequested)
+        {
+            /* The client cancelled the call, so there is nothing to report to it. SqlClient reports
+               a cancel that lands while the server is still running the query as a SqlException
+               ("Operation cancelled by user."), not an OperationCanceledException, so it would be
+               returned below as a failure (#628). */
+            throw new OperationCanceledException(ex.Message, ex, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            return McpHelpers.FormatError("get_query_store_top", ex);
+        }
+    }
+
+    internal static PlanSession CaptureSession(
+        string sessionId,
+        string label,
+        ParsedPlan parsed,
+        string? queryText,
+        string connectionInfo)
+    {
+        /* Query Store keeps the full query_sql_text, so a statement past the showplan cap gets its
+           complete text in the analysis the same way a session-captured plan does (#502). */
+        var analysis = ResultMapper.Map(parsed, "query-store", capturedQueryText: queryText);
+
+        /* #456 follow-up: the counts used to come from a second walk over batch.Statements while
+           the Analysis stored on this very session is mapped from PlanStatements.EnumerateAll —
+           stored procedure and UDF bodies included, node-level warnings counted — so a Query
+           Store EXEC plan registered statement_count 1 and warning_count 0 alongside an analysis
+           full of findings. The counts now come from that analysis's own summary: one source, and
+           nothing left to disagree with what an MCP client reads. */
+        var executableStatement = Core.Services.PlanStatements.EnumerateAll(parsed)
+            .FirstOrDefault(statement => statement.RootNode is not null);
+
+        var session = new PlanSession
+        {
+            SessionId = sessionId,
+            Label = label,
+            Source = "query-store",
+            Plan = parsed,
+            Analysis = analysis,
+            RawPlanXml = parsed.RawXml,
+            DatabaseName = executableStatement?.RootNode?.DatabaseName,
+            QueryText = queryText,
+            ConnectionInfo = connectionInfo,
+            StatementCount = analysis.Summary.TotalStatements,
+            HasActualStats = analysis.Summary.HasActualStats,
+            WarningCount = analysis.Summary.TotalWarnings,
+            CriticalWarningCount = analysis.Summary.CriticalWarnings,
+            MissingIndexCount = analysis.Summary.MissingIndexes
+        };
+
+        parsed.RawXml = string.Empty;
+        parsed.Batches.Clear();
+        return session;
+    }
+
+    private static Core.Models.ServerConnection? FindConnection(
+        ConnectionStore store, string name)
+    {
+        var connections = store.Load();
+        return connections.FirstOrDefault(c =>
+            c.ServerName.Equals(name, StringComparison.OrdinalIgnoreCase) ||
+            (!string.IsNullOrEmpty(c.DisplayName) &&
+             c.DisplayName.Equals(name, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static string ConnectionNotFound(ConnectionStore store, string name)
+    {
+        var connections = store.Load();
+        if (connections.Count == 0)
+            return "No saved connections. Add a connection in the application via the query editor toolbar.";
+        var available = string.Join(", ", connections.Select(c =>
+            string.IsNullOrEmpty(c.DisplayName) ? c.ServerName : $"{c.DisplayName} ({c.ServerName})"));
+        return $"Connection '{name}' not found. Available: {available}";
+    }
+}

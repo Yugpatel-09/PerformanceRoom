@@ -1,0 +1,92 @@
+using Avalonia.Controls;
+using Avalonia.Interactivity;
+
+namespace PlanViewer.App.Services;
+
+/// <summary>
+/// App-wide interception of TextBox and SelectableTextBlock clipboard operations.
+/// Avalonia's built-in
+/// TextBox.Copy()/Cut() are async void with an unguarded clipboard await, and
+/// Paste() catches only TimeoutException, so a locked Windows clipboard
+/// (CLIPBRD_E_CANT_OPEN) crashes the app (issue #415). TextBox raises these
+/// routed events before touching the clipboard and skips its internal path when
+/// they are handled, so one class handler per event covers every TextBox in the
+/// app, including ones created later.
+/// </summary>
+internal static class TextBoxClipboardGuard
+{
+    private static bool _registered;
+
+    public static void Register()
+    {
+        // Once per process. The real app calls this once at startup anyway, but the test
+        // harness (#451) boots a fresh App per test dispatch, and class handlers live on the
+        // static routed events — not the Application — so each boot was stacking another set
+        // of handlers onto every TextBox in the test host. The guard stays registered for
+        // any test that exercises clipboard behavior; it just stops accumulating.
+        if (_registered)
+            return;
+        _registered = true;
+
+        TextBox.CopyingToClipboardEvent.AddClassHandler<TextBox>(OnCopying);
+        TextBox.CuttingToClipboardEvent.AddClassHandler<TextBox>(OnCutting);
+        TextBox.PastingFromClipboardEvent.AddClassHandler<TextBox>(OnPasting);
+
+        // SelectableTextBlock registers its own CopyingToClipboard routed event rather than
+        // sharing TextBox's (the two event objects are not reference-equal), so the handlers
+        // above never fire for it — and its built-in Copy() is the same async void over an
+        // unguarded SetTextAsync that #415 was about. It is read-only, so copy is the only
+        // clipboard operation it has.
+        SelectableTextBlock.CopyingToClipboardEvent.AddClassHandler<SelectableTextBlock>(OnSelectableCopying);
+    }
+
+    // CanCopy/CanCut/CanPaste mirror the built-in gates (password box, read-only,
+    // empty selection); when they are false the built-in path is a no-op that never
+    // touches the clipboard, so leaving the event unhandled there is safe.
+
+    private static void OnCopying(TextBox textBox, RoutedEventArgs e)
+    {
+        if (!textBox.CanCopy)
+            return;
+
+        e.Handled = true;
+        _ = ClipboardHelper.TrySetTextAsync(textBox, textBox.SelectedText);
+    }
+
+    private static void OnSelectableCopying(SelectableTextBlock block, RoutedEventArgs e)
+    {
+        if (!block.CanCopy)
+            return;
+
+        e.Handled = true;
+        _ = ClipboardHelper.TrySetTextAsync(block, block.SelectedText);
+    }
+
+    private static async void OnCutting(TextBox textBox, RoutedEventArgs e)
+    {
+        if (!textBox.CanCut)
+            return;
+
+        e.Handled = true;
+        // Handling the event suppresses the built-in DeleteSelection, so clear the
+        // selection here - and only once the text actually reached the clipboard.
+        if (await ClipboardHelper.TrySetTextAsync(textBox, textBox.SelectedText))
+            textBox.SelectedText = "";
+    }
+
+    private static async void OnPasting(TextBox textBox, RoutedEventArgs e)
+    {
+        if (!textBox.CanPaste)
+            return;
+
+        e.Handled = true;
+        var text = await ClipboardHelper.TryGetTextAsync(textBox);
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        if (!textBox.AcceptsReturn)
+            text = text.Replace("\r", "").Replace("\n", "");
+
+        textBox.SelectedText = text;
+    }
+}

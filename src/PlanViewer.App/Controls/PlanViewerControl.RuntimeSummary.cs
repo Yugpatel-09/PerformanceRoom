@@ -1,0 +1,293 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Interactivity;
+using Avalonia.Layout;
+using Avalonia.Media;
+using PlanViewer.App.Services;
+using PlanViewer.Core.Models;
+using PlanViewer.Core.Output;
+using PlanViewer.Core.Services;
+
+namespace PlanViewer.App.Controls;
+
+public partial class PlanViewerControl : UserControl
+{
+    private void ShowRuntimeSummary(PlanStatement statement)
+    {
+        RuntimeSummaryContent.Children.Clear();
+
+        // Muted labels, full-strength values: the numbers are the content, the labels are scaffolding.
+        var labelBrush = FindBrushResource("ForegroundMutedBrush");
+        var valueBrush = FindBrushResource("ForegroundBrush");
+
+        var grid = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("Auto,*")
+        };
+        int rowIndex = 0;
+
+        // nested: the row is a detail of the row above it, so its label is indented under that row's.
+        void AddRow(string label, string value, string? brushKey = null, bool nested = false)
+        {
+            grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+
+            var labelText = new TextBlock
+            {
+                Text = label,
+                FontSize = 11,
+                Foreground = labelBrush,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Margin = new Thickness(nested ? 12 : 0, 1, 8, 1)
+            };
+            Grid.SetRow(labelText, rowIndex);
+            Grid.SetColumn(labelText, 0);
+            grid.Children.Add(labelText);
+
+            var valueText = new TextBlock
+            {
+                Text = value,
+                FontSize = 11,
+                Foreground = brushKey == null ? valueBrush : FindBrushResource(brushKey),
+                Margin = new Thickness(0, 1, 0, 1)
+            };
+            Grid.SetRow(valueText, rowIndex);
+            Grid.SetColumn(valueText, 1);
+            grid.Children.Add(valueText);
+
+            rowIndex++;
+        }
+
+        // Efficiency thresholds: plain >= 40%, warning >= 20%, error < 20%.
+        // Loosened per Joe's feedback (#215 C1): for memory grants, moderate
+        // utilization (e.g. 60%) is fine — operators can spill near their max,
+        // so we shouldn't flag anything above a real over-grant threshold.
+        static string EfficiencyBrushKey(double pct) => pct >= 40 ? "ForegroundBrush"
+            : pct >= 20 ? "WarningBrush" : "ErrorBrush";
+
+        // Memory grant color tiers (#215 C1 + E8 + E9): over-used grant (error),
+        // any operator spilled (warning), otherwise tier by utilization.
+        static string MemoryGrantBrushKey(double pctUsed, bool hasSpill)
+        {
+            if (pctUsed > 100) return "ErrorBrush";
+            if (hasSpill) return "WarningBrush";
+            if (pctUsed >= 40) return "ForegroundBrush";
+            if (pctUsed >= 20) return "WarningBrush";
+            return "ErrorBrush";
+        }
+
+        // E7: rename the panel title for estimated plans
+        var isEstimated = statement.QueryTimeStats == null;
+        RuntimeSummaryTitle.Text = isEstimated ? "Predicted Runtime" : "Runtime Summary";
+
+        var hasSpillInTree = statement.RootNode != null && HasSpillInPlanTree(statement.RootNode);
+
+        // E11: order — Elapsed → CPU:Elapsed → DOP → CPU → Compile → Memory → Used → CE Model → Optimization → Cost.
+        // #613 moved CE Model above Optimization, so Optimization and its nested early abort reason end the list.
+        // Extra Avalonia-only rows (threads, UDF, cached plan size) kept near their logical neighbors.
+
+        if (statement.QueryTimeStats != null)
+        {
+            AddRow("Elapsed", $"{statement.QueryTimeStats.ElapsedTimeMs:N0}ms");
+            if (statement.QueryTimeStats.ElapsedTimeMs > 0)
+            {
+                long externalWaitMs = 0;
+                foreach (var w in statement.WaitStats)
+                    if (BenefitScorer.IsExternalWait(w.WaitType))
+                        externalWaitMs += w.WaitTimeMs;
+                var effectiveCpu = Math.Max(0L, statement.QueryTimeStats.CpuTimeMs - externalWaitMs);
+                var ratio = (double)effectiveCpu / statement.QueryTimeStats.ElapsedTimeMs;
+                AddRow("CPU:Elapsed", ratio.ToString("N2"));
+            }
+        }
+
+        // DOP + parallelism efficiency
+        if (statement.DegreeOfParallelism > 0)
+        {
+            var dopText = statement.DegreeOfParallelism.ToString();
+            string? dopBrushKey = null;
+            if (statement.QueryTimeStats != null &&
+                statement.QueryTimeStats.ElapsedTimeMs > 0 &&
+                statement.QueryTimeStats.CpuTimeMs > 0 &&
+                statement.DegreeOfParallelism > 1)
+            {
+                long externalWaitMs = 0;
+                foreach (var w in statement.WaitStats)
+                    if (BenefitScorer.IsExternalWait(w.WaitType))
+                        externalWaitMs += w.WaitTimeMs;
+                var effectiveCpu = Math.Max(0, statement.QueryTimeStats.CpuTimeMs - externalWaitMs);
+                var speedup = (double)effectiveCpu / statement.QueryTimeStats.ElapsedTimeMs;
+                var efficiency = Math.Min(100.0, (speedup - 1.0) / (statement.DegreeOfParallelism - 1.0) * 100.0);
+                efficiency = Math.Max(0.0, efficiency);
+                dopText += $" ({efficiency:N0}% efficient)";
+                dopBrushKey = EfficiencyBrushKey(efficiency);
+            }
+            AddRow("DOP", dopText, dopBrushKey);
+        }
+        else if (statement.NonParallelPlanReason != null)
+            AddRow("Serial", statement.NonParallelPlanReason);
+
+        if (statement.QueryTimeStats != null)
+        {
+            AddRow("CPU", $"{statement.QueryTimeStats.CpuTimeMs:N0}ms");
+            if (statement.QueryUdfCpuTimeMs > 0)
+                AddRow("UDF CPU", $"{statement.QueryUdfCpuTimeMs:N0}ms");
+            if (statement.QueryUdfElapsedTimeMs > 0)
+                AddRow("UDF elapsed", $"{statement.QueryUdfElapsedTimeMs:N0}ms");
+        }
+
+        // Compile stats (category B plan-level property)
+        if (statement.CompileTimeMs > 0)
+            AddRow("Compile", $"{statement.CompileTimeMs:N0}ms");
+        if (statement.CachedPlanSizeKB > 0)
+            AddRow("Cached plan size", $"{statement.CachedPlanSizeKB:N0} KB");
+
+        // Memory grant — color per new tiers, spill indicator if any operator spilled
+        if (statement.MemoryGrant != null)
+        {
+            var mg = statement.MemoryGrant;
+            var spillTag = hasSpillInTree ? " ⚠ spill" : "";
+            if (mg.GrantedMemoryKB > 0)
+            {
+                var grantPct = (double)mg.MaxUsedMemoryKB / mg.GrantedMemoryKB * 100;
+                var grantBrushKey = MemoryGrantBrushKey(grantPct, hasSpillInTree);
+                AddRow("Memory grant",
+                    $"{TextFormatter.FormatMemoryGrantKB(mg.GrantedMemoryKB)} granted, {TextFormatter.FormatMemoryGrantKB(mg.MaxUsedMemoryKB)} used ({grantPct:N0}%){spillTag}",
+                    grantBrushKey);
+            }
+            else
+            {
+                // #595: a 0 KB grant isn't "0 KB used (100%)" — there was nothing to use a
+                // percentage of. Say so plainly, in the same neutral color as every other
+                // row that isn't flagging a problem.
+                AddRow("Memory grant", $"No memory grant{spillTag}");
+            }
+            if (mg.GrantWaitTimeMs > 0)
+                AddRow("Grant wait", $"{mg.GrantWaitTimeMs:N0}ms", "ErrorBrush");
+        }
+
+        // Thread stats
+        if (statement.ThreadStats != null)
+        {
+            var ts = statement.ThreadStats;
+            AddRow("Branches", ts.Branches.ToString());
+            var totalReserved = ts.Reservations.Sum(r => r.ReservedThreads);
+            if (totalReserved > 0)
+            {
+                var threadPct = (double)ts.UsedThreads / totalReserved * 100;
+                var threadBrushKey = EfficiencyBrushKey(threadPct);
+                var threadText = ts.UsedThreads == totalReserved
+                    ? $"{ts.UsedThreads} used ({totalReserved} reserved)"
+                    : $"{ts.UsedThreads} used of {totalReserved} reserved ({totalReserved - ts.UsedThreads} inactive)";
+                AddRow("Threads", threadText, threadBrushKey);
+            }
+            else
+            {
+                AddRow("Threads", $"{ts.UsedThreads} used");
+            }
+        }
+
+        // CE model, then Optimization. #613: the early abort reason is part of the optimization
+        // result, not a fact of its own, so it sits under the Optimization row.
+        if (statement.CardinalityEstimationModelVersion > 0)
+            AddRow("CE model", statement.CardinalityEstimationModelVersion.ToString());
+        var hasOptimizationRow = !string.IsNullOrEmpty(statement.StatementOptmLevel);
+        if (hasOptimizationRow)
+            AddRow("Optimization", statement.StatementOptmLevel!);
+        if (!string.IsNullOrEmpty(statement.StatementOptmEarlyAbortReason))
+            AddRow("Early abort", statement.StatementOptmEarlyAbortReason, nested: hasOptimizationRow);
+
+        if (grid.Children.Count > 0)
+        {
+            RuntimeSummaryContent.Children.Add(grid);
+            RuntimeSummaryEmpty.IsVisible = false;
+        }
+        else
+        {
+            RuntimeSummaryEmpty.IsVisible = true;
+        }
+        SetInsightQuiet(RuntimeSummaryTitle, RuntimeSummaryAccent, grid.Children.Count == 0);
+        ShowServerContext();
+    }
+
+    private void ShowServerContext()
+    {
+        ServerContextContent.Children.Clear();
+        if (_serverMetadata == null)
+        {
+            ServerContextEmpty.IsVisible = true;
+            ServerContextBorder.IsVisible = true;
+            SetInsightQuiet(ServerContextHeader, ServerContextAccent, true);
+            return;
+        }
+
+        ServerContextEmpty.IsVisible = false;
+        SetInsightQuiet(ServerContextHeader, ServerContextAccent, false);
+
+        var m = _serverMetadata;
+        // Same split as Runtime Summary: muted labels, full-strength values.
+        var labelBrush = FindBrushResource("ForegroundMutedBrush");
+        var valueBrush = FindBrushResource("ForegroundBrush");
+
+        var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*") };
+        int rowIndex = 0;
+
+        void AddRow(string label, string value)
+        {
+            grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+            var lb = new TextBlock
+            {
+                Text = label, FontSize = 11,
+                Foreground = labelBrush,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Margin = new Thickness(0, 1, 8, 1)
+            };
+            Grid.SetRow(lb, rowIndex);
+            Grid.SetColumn(lb, 0);
+            grid.Children.Add(lb);
+
+            var vb = new TextBlock
+            {
+                Text = value, FontSize = 11,
+                Foreground = valueBrush,
+                Margin = new Thickness(0, 1, 0, 1)
+            };
+            Grid.SetRow(vb, rowIndex);
+            Grid.SetColumn(vb, 1);
+            grid.Children.Add(vb);
+            rowIndex++;
+        }
+
+        // Server name + edition
+        var edition = m.Edition;
+        if (edition != null)
+        {
+            var idx = edition.IndexOf(" (64-bit)");
+            if (idx > 0) edition = edition[..idx];
+        }
+        var serverLine = m.ServerName ?? "Unknown";
+        if (edition != null) serverLine += $" ({edition})";
+        if (m.ProductVersion != null) serverLine += $", {m.ProductVersion}";
+        AddRow("Server", serverLine);
+
+        // Hardware
+        if (m.CpuCount > 0)
+            AddRow("Hardware", $"{m.CpuCount} CPUs, {m.PhysicalMemoryMB:N0} MB RAM");
+
+        // Instance settings
+        AddRow("MAXDOP", m.MaxDop.ToString());
+        AddRow("Cost threshold", m.CostThresholdForParallelism.ToString());
+        AddRow("Max memory", $"{m.MaxServerMemoryMB:N0} MB");
+
+        // Database
+        if (m.Database != null)
+            AddRow("Database", $"{m.Database.Name} (compat {m.Database.CompatibilityLevel})");
+
+        ServerContextContent.Children.Add(grid);
+        ServerContextBorder.IsVisible = true;
+    }
+
+}

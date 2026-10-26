@@ -1,0 +1,652 @@
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.Data.Sqlite;
+using PlanShare;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// CORS — allow all origins for WASM client
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+        policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
+});
+
+// Database path — data/ subdirectory relative to the binary. PlanShare:DataDir moves it
+// (the endpoint tests and local runs point it at a temp folder).
+var dataDir = builder.Configuration["PlanShare:DataDir"] ?? Path.Combine(AppContext.BaseDirectory, "data");
+Directory.CreateDirectory(dataDir);
+var dbPath = Path.Combine(dataDir, "plans.db");
+var connectionString = $"Data Source={dbPath}";
+
+// Initialize database
+using (var conn = new SqliteConnection(connectionString))
+{
+    conn.Open();
+    using var cmd = conn.CreateCommand();
+    cmd.CommandText = """
+        CREATE TABLE IF NOT EXISTS plans (
+            id TEXT PRIMARY KEY,
+            data TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            delete_token TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS page_views (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            referrer TEXT,
+            visitor_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_pv_created ON page_views(created_at);
+        """;
+    cmd.ExecuteNonQuery();
+}
+
+// --- Visitor hash salt ---
+// SHA256(ip|ua|day) truncated to 16 hex is brute-forceable straight back to the
+// source IP: IPv4 is only 2^32, the User-Agent is guessable, and the day is
+// known. Without a secret in the mix, "no PII stored" is not true. The salt is
+// generated once and kept in a file beside the DB, never in the DB itself, so
+// a copy of plans.db does not carry the means to reverse its own hashes.
+var saltPath = Path.Combine(dataDir, "visitor-salt.bin");
+byte[] visitorSalt;
+if (File.Exists(saltPath))
+{
+    visitorSalt = File.ReadAllBytes(saltPath);
+}
+else
+{
+    visitorSalt = RandomNumberGenerator.GetBytes(32);
+    File.WriteAllBytes(saltPath, visitorSalt);
+}
+
+// --- Rate limiters (in-memory) ---
+// Created before Build() so they can be DI-registered and swept by CleanupService.
+var rateLimiter = new RateLimiter(maxRequests: 10, windowSeconds: 60);
+var analyticsRateLimiter = new RateLimiter(maxRequests: 30, windowSeconds: 60);
+// Plan reads are cheap but unbounded reads let anyone enumerate or scrape the
+// store; 120/min per IP is far above any human's browsing rate.
+var readRateLimiter = new RateLimiter(maxRequests: 120, windowSeconds: 60);
+
+// --- Storage limit and daily upload budget ---
+// The production disk is 40 GB, so shares are refused (507) once the database uses 10 GB of pages.
+// The budget is the most plan data one client key can store per UTC day (429 after that).
+// PlanShare:MaxDatabaseBytes and PlanShare:DailyUploadBytes override the two limits, which lets
+// the endpoint tests use small values.
+const long MaxDatabaseBytes = 10L * 1024 * 1024 * 1024;
+const long DailyUploadBytes = 100L * 1024 * 1024;
+var storageCheck = new StorageCheck(
+    connectionString,
+    builder.Configuration.GetValue<long?>("PlanShare:MaxDatabaseBytes") ?? MaxDatabaseBytes);
+var uploadBudget = new UploadBudget(
+    builder.Configuration.GetValue<long?>("PlanShare:DailyUploadBytes") ?? DailyUploadBytes);
+
+// Register the cleanup background service
+builder.Services.AddSingleton(new PlanDbConfig(connectionString));
+builder.Services.AddSingleton(new RateLimiters(rateLimiter, analyticsRateLimiter, readRateLimiter));
+builder.Services.AddSingleton(uploadBudget);
+builder.Services.AddHostedService<CleanupService>();
+
+// Request size limit (10 MB). nginx on the server sets the same limit for /api/
+// (client_max_body_size 10m); without it, nginx's 1 MB default refuses larger shares
+// first. The web client's too-large message (PlanShareService) also names 10 MB.
+// Change all three together.
+builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 10 * 1024 * 1024);
+
+var app = builder.Build();
+
+// This runs behind nginx on loopback, which sets X-Real-IP and X-Forwarded-For.
+// Without this middleware every request's RemoteIpAddress is 127.0.0.1, so all
+// three rate limiters key on the same value and become a single GLOBAL cap
+// shared by every visitor rather than per-IP limits — one busy client would
+// throttle everyone, and one abusive client could not be isolated.
+//
+// KnownProxies is restricted to loopback deliberately: trusting X-Forwarded-For
+// from arbitrary sources would let any caller spoof its address and bypass the
+// limits entirely. Only the local nginx is believed.
+var forwardedOptions = new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto,
+    ForwardLimit = 1
+};
+forwardedOptions.KnownProxies.Clear();
+forwardedOptions.KnownIPNetworks.Clear();
+forwardedOptions.KnownProxies.Add(System.Net.IPAddress.Loopback);
+forwardedOptions.KnownProxies.Add(System.Net.IPAddress.IPv6Loopback);
+app.UseForwardedHeaders(forwardedOptions);
+
+app.UseCors();
+
+const int MaxTtlDays = 365;
+
+// Longest page path an analytics event may carry. Real paths are a few characters.
+const int MaxEventPathLength = 512;
+
+// Depth ceiling for parsing an uploaded share, mirroring PlanViewer.Core's
+// AnalysisJson.MaxDepth — that class is the source of truth for how deep a serialized
+// AnalysisResult can go (#431: an operator costs two JSON levels, so the JsonDocument
+// default of 64 rejects a plan ~30 operators deep as "Invalid JSON" after the client
+// happily serialized it at 1024). Mirrored rather than referenced because this project
+// deliberately takes no dependency on PlanViewer.Core, and a shared constant only helps
+// call sites that reference it; this one cannot. If AnalysisJson.MaxDepth ever changes,
+// change this with it — the client-side depth tests pin 1024, so start there.
+var shareDocumentOptions = new JsonDocumentOptions { MaxDepth = 1024 };
+
+// --- Endpoints ---
+
+app.MapGet("/health", () => Results.Content("OK", "text/plain"));
+
+app.MapPost("/api/share", async (HttpContext ctx) =>
+{
+    // Rate limit by client key (IPv4 address, or the /64 of an IPv6 address)
+    var client = ClientKey.From(ctx.Connection.RemoteIpAddress);
+    if (!rateLimiter.IsAllowed(client))
+    {
+        return Error(429, "Too many shares from your network. Please wait a minute and try again.");
+    }
+
+    // Read raw body
+    using var reader = new StreamReader(ctx.Request.Body);
+    var body = await reader.ReadToEndAsync();
+
+    if (string.IsNullOrWhiteSpace(body))
+    {
+        return Error(400, "Empty body");
+    }
+
+    // Parse and extract ttl_days from the JSON. shareDocumentOptions, not defaults: this body
+    // wraps a full serialized analysis, and the default 64-level ceiling turned a deep plan's
+    // legitimate upload into a 400 before ttl_days was ever read.
+    int ttlDays = 7;
+    try
+    {
+        using var doc = JsonDocument.Parse(body, shareDocumentOptions);
+        // TryGetProperty and TryGetInt32 throw (a 500) on the wrong kind of element, so check the kind first
+        if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            return Error(400, "The request body must be a JSON object.");
+        if (doc.RootElement.TryGetProperty("ttl_days", out var ttlProp) && ttlProp.ValueKind != JsonValueKind.Null)
+        {
+            if (ttlProp.ValueKind != JsonValueKind.Number)
+                return Error(400, "ttl_days must be a number.");
+            if (ttlProp.TryGetInt32(out var t))
+                ttlDays = Math.Clamp(t, 1, MaxTtlDays);
+        }
+    }
+    catch (JsonException)
+    {
+        return Error(400, "Invalid JSON");
+    }
+
+    if (storageCheck.IsFull())
+    {
+        return Error(507, "Plan sharing is full right now. Please try again later.");
+    }
+
+    // The stored size is the UTF-8 length of the body; ContentLength can be absent
+    if (!uploadBudget.TryCharge(client, Encoding.UTF8.GetByteCount(body)))
+    {
+        return Error(429, "Daily sharing limit reached for your network. Please try again tomorrow.");
+    }
+
+    var id = GenerateId();
+    var deleteToken = GenerateDeleteToken();
+    var now = DateTime.UtcNow;
+    var expiresAt = now.AddDays(ttlDays);
+
+    using var conn = new SqliteConnection(connectionString);
+    conn.Open();
+    using var cmd = conn.CreateCommand();
+    cmd.CommandText = "INSERT INTO plans (id, data, created_at, expires_at, delete_token) VALUES (@id, @data, @created_at, @expires_at, @delete_token)";
+    cmd.Parameters.AddWithValue("@id", id);
+    cmd.Parameters.AddWithValue("@data", body);
+    cmd.Parameters.AddWithValue("@created_at", now.ToString("o"));
+    cmd.Parameters.AddWithValue("@expires_at", expiresAt.ToString("o"));
+    cmd.Parameters.AddWithValue("@delete_token", deleteToken);
+    cmd.ExecuteNonQuery();
+
+    return Results.Content(
+        $"{{\"id\":\"{id}\",\"delete_token\":\"{deleteToken}\",\"expires_at\":\"{expiresAt:yyyy-MM-dd}\"}}",
+        "application/json");
+});
+
+app.MapGet("/api/plans/{id}", (string id, HttpContext ctx) =>
+{
+    var readClient = ClientKey.From(ctx.Connection.RemoteIpAddress);
+    if (!readRateLimiter.IsAllowed(readClient))
+        return Results.StatusCode(429);
+
+    using var conn = new SqliteConnection(connectionString);
+    conn.Open();
+    using var cmd = conn.CreateCommand();
+    cmd.CommandText = "SELECT data FROM plans WHERE id = @id AND expires_at > @now";
+    cmd.Parameters.AddWithValue("@id", id);
+    cmd.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("o"));
+
+    var result = cmd.ExecuteScalar() as string;
+    if (result is null)
+    {
+        return Results.NotFound();
+    }
+
+    return Results.Content(result, "application/json");
+});
+
+// --- Analytics: page view tracking ---
+
+app.MapPost("/api/event", async (HttpContext ctx) =>
+{
+    // Rate limit: 30 events/min per client key (generous — covers page nav + shares)
+    if (!analyticsRateLimiter.IsAllowed(ClientKey.From(ctx.Connection.RemoteIpAddress)))
+        return Results.StatusCode(429);
+
+    using var reader = new StreamReader(ctx.Request.Body);
+    var body = await reader.ReadToEndAsync();
+
+    string path = "/";
+    string? referrer = null;
+    try
+    {
+        using var doc = JsonDocument.Parse(body);
+        // GetString() throws (a 500) on a non-string element, so check the kind first.
+        // JSON null counts as "not sent", like a missing property.
+        if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            return Error(400, "The request body must be a JSON object.");
+        if (doc.RootElement.TryGetProperty("path", out var p) && p.ValueKind != JsonValueKind.Null)
+        {
+            if (p.ValueKind != JsonValueKind.String)
+                return Error(400, "path must be a string.");
+            path = p.GetString() ?? "/";
+        }
+        if (doc.RootElement.TryGetProperty("referrer", out var r) && r.ValueKind != JsonValueKind.Null)
+        {
+            if (r.ValueKind != JsonValueKind.String)
+                return Error(400, "referrer must be a string.");
+            referrer = r.GetString();
+        }
+    }
+    catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+    {
+        // InvalidOperationException: GetString() on a string with a lone surrogate escape
+        return Error(400, "Invalid JSON");
+    }
+
+    if (path.Length > MaxEventPathLength)
+        return Error(400, $"path must be {MaxEventPathLength} characters or fewer.");
+
+    // Strip referrer to domain only (no full URLs with query params).
+    // If it doesn't parse as an absolute URL, drop it — never persist raw
+    // client-supplied strings, since the dashboard renders referrers in HTML.
+    if (!string.IsNullOrEmpty(referrer))
+    {
+        referrer = Uri.TryCreate(referrer, UriKind.Absolute, out var refUri)
+            ? refUri.Host
+            : null;
+    }
+
+    // Visitor hash: HMAC-SHA256(secret salt, IP + User-Agent + date) — unique per
+    // day. The salt is what makes this one-way in practice: without it the input
+    // space (IPv4 = 2^32, guessable UA, known date) is small enough to brute
+    // force straight back to the source IP, so an unsalted digest would still be
+    // personal data despite looking like a hash.
+    // The hash takes the full address, not the client key: a /64 would count every host in
+    // it as one visitor.
+    var ip = ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    var ua = ctx.Request.Headers.UserAgent.FirstOrDefault() ?? "";
+    var day = DateTime.UtcNow.ToString("yyyy-MM-dd");
+    var visitorHash = Convert.ToHexString(
+        HMACSHA256.HashData(visitorSalt, Encoding.UTF8.GetBytes($"{ip}|{ua}|{day}"))).ToLower()[..16];
+
+    // A full store drops the event and still answers 200: analytics must never show an error
+    if (storageCheck.IsFull())
+        return Results.Ok();
+
+    using var conn = new SqliteConnection(connectionString);
+    conn.Open();
+    using var cmd = conn.CreateCommand();
+    cmd.CommandText = "INSERT INTO page_views (path, referrer, visitor_hash, created_at) VALUES (@path, @referrer, @hash, @now)";
+    cmd.Parameters.AddWithValue("@path", path);
+    cmd.Parameters.AddWithValue("@referrer", (object?)referrer ?? DBNull.Value);
+    cmd.Parameters.AddWithValue("@hash", visitorHash);
+    cmd.Parameters.AddWithValue("@now", DateTime.UtcNow.ToString("o"));
+    cmd.ExecuteNonQuery();
+
+    return Results.Ok();
+});
+
+app.MapGet("/api/stats", (HttpContext ctx) =>
+{
+    // Opt-in auth. /api/stats exposes share counts, daily traffic, unique
+    // visitors and top referrers — operational data, not something that needs
+    // to be world-readable. Set STATS_TOKEN to require it; leaving it unset
+    // keeps the current public behaviour so the dashboard cannot break just by
+    // deploying this. Compared with a fixed-time comparison so the token cannot
+    // be recovered a byte at a time.
+    //
+    // Header only, no ?token= fallback: a query-string token is written to the
+    // nginx access log in plaintext — the exact leak the dashboard's
+    // fragment-based bootstrap (#token=..., sent back as X-Stats-Token) exists
+    // to avoid.
+    var expectedToken = Environment.GetEnvironmentVariable("STATS_TOKEN");
+    if (!string.IsNullOrEmpty(expectedToken))
+    {
+        var supplied = ctx.Request.Headers["X-Stats-Token"].FirstOrDefault()
+                       ?? "";
+        var a = Encoding.UTF8.GetBytes(supplied);
+        var b = Encoding.UTF8.GetBytes(expectedToken);
+        if (a.Length != b.Length || !CryptographicOperations.FixedTimeEquals(a, b))
+            return Results.StatusCode(401);
+    }
+
+    using var conn = new SqliteConnection(connectionString);
+    conn.Open();
+    var now = DateTime.UtcNow.ToString("o");
+    var cutoff30 = DateTime.UtcNow.AddDays(-30).ToString("o");
+    var cutoff7 = DateTime.UtcNow.AddDays(-7).ToString("o");
+    var today = DateTime.UtcNow.ToString("yyyy-MM-dd");
+
+    // --- Plan sharing stats ---
+    long totalShared;
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = "SELECT COUNT(*) FROM plans";
+        totalShared = (long)cmd.ExecuteScalar()!;
+    }
+
+    long activePlans;
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = "SELECT COUNT(*) FROM plans WHERE expires_at > @now";
+        cmd.Parameters.AddWithValue("@now", now);
+        activePlans = (long)cmd.ExecuteScalar()!;
+    }
+
+    var dailyShares = new List<object>();
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = """
+            SELECT DATE(created_at) as day, COUNT(*) as count
+            FROM plans WHERE created_at > @cutoff
+            GROUP BY DATE(created_at) ORDER BY day
+            """;
+        cmd.Parameters.AddWithValue("@cutoff", cutoff30);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            dailyShares.Add(new { day = reader.GetString(0), count = reader.GetInt64(1) });
+    }
+
+    // --- Page view stats ---
+    long viewsToday;
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = "SELECT COUNT(*) FROM page_views WHERE DATE(created_at) = @today";
+        cmd.Parameters.AddWithValue("@today", today);
+        viewsToday = (long)cmd.ExecuteScalar()!;
+    }
+
+    long visitorsToday;
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = "SELECT COUNT(DISTINCT visitor_hash) FROM page_views WHERE DATE(created_at) = @today";
+        cmd.Parameters.AddWithValue("@today", today);
+        visitorsToday = (long)cmd.ExecuteScalar()!;
+    }
+
+    long views7d;
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = "SELECT COUNT(*) FROM page_views WHERE created_at > @cutoff";
+        cmd.Parameters.AddWithValue("@cutoff", cutoff7);
+        views7d = (long)cmd.ExecuteScalar()!;
+    }
+
+    long visitors7d;
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = "SELECT COUNT(DISTINCT visitor_hash) FROM page_views WHERE created_at > @cutoff";
+        cmd.Parameters.AddWithValue("@cutoff", cutoff7);
+        visitors7d = (long)cmd.ExecuteScalar()!;
+    }
+
+    long views30d;
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = "SELECT COUNT(*) FROM page_views WHERE created_at > @cutoff";
+        cmd.Parameters.AddWithValue("@cutoff", cutoff30);
+        views30d = (long)cmd.ExecuteScalar()!;
+    }
+
+    long visitors30d;
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = "SELECT COUNT(DISTINCT visitor_hash) FROM page_views WHERE created_at > @cutoff";
+        cmd.Parameters.AddWithValue("@cutoff", cutoff30);
+        visitors30d = (long)cmd.ExecuteScalar()!;
+    }
+
+    var dailyViews = new List<object>();
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = """
+            SELECT DATE(created_at) as day, COUNT(*) as views, COUNT(DISTINCT visitor_hash) as visitors
+            FROM page_views WHERE created_at > @cutoff
+            GROUP BY DATE(created_at) ORDER BY day
+            """;
+        cmd.Parameters.AddWithValue("@cutoff", cutoff30);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            dailyViews.Add(new { day = reader.GetString(0), views = reader.GetInt64(1), visitors = reader.GetInt64(2) });
+    }
+
+    var topReferrers = new List<object>();
+    using (var cmd = conn.CreateCommand())
+    {
+        cmd.CommandText = """
+            SELECT referrer, COUNT(*) as count
+            FROM page_views WHERE created_at > @cutoff AND referrer IS NOT NULL AND referrer != ''
+            GROUP BY referrer ORDER BY count DESC LIMIT 10
+            """;
+        cmd.Parameters.AddWithValue("@cutoff", cutoff30);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            topReferrers.Add(new { referrer = reader.GetString(0), count = reader.GetInt64(1) });
+    }
+
+    return Results.Json(new
+    {
+        sharing = new { total_shared = totalShared, active_plans = activePlans, daily = dailyShares },
+        traffic = new
+        {
+            today = new { views = viewsToday, visitors = visitorsToday },
+            last_7d = new { views = views7d, visitors = visitors7d },
+            last_30d = new { views = views30d, visitors = visitors30d },
+            daily = dailyViews,
+            top_referrers = topReferrers
+        }
+    });
+});
+
+app.MapDelete("/api/plans/{id}", (string id, HttpContext ctx) =>
+{
+    // Header first: a ?token= query string is written to the nginx access log. The query form
+    // stays for clients built before the header existed.
+    var token = ctx.Request.Headers["X-Delete-Token"].FirstOrDefault();
+    if (string.IsNullOrEmpty(token))
+        token = ctx.Request.Query["token"].FirstOrDefault();
+    if (string.IsNullOrEmpty(token))
+    {
+        return Error(400, "Missing delete token");
+    }
+
+    using var conn = new SqliteConnection(connectionString);
+    conn.Open();
+    using var cmd = conn.CreateCommand();
+    cmd.CommandText = "DELETE FROM plans WHERE id = @id AND delete_token = @token";
+    cmd.Parameters.AddWithValue("@id", id);
+    cmd.Parameters.AddWithValue("@token", token);
+    var deleted = cmd.ExecuteNonQuery();
+
+    return deleted > 0 ? Results.Ok() : Results.NotFound();
+});
+
+app.Run();
+
+// --- Helpers ---
+
+static string GenerateId()
+{
+    // The id is the only access control on a shared plan, so it must be
+    // unpredictable — use a cryptographic RNG, not Random.Shared (xoshiro).
+    const string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    return new string(RandomNumberGenerator.GetItems<char>(chars.AsSpan(), 8));
+}
+
+static string GenerateDeleteToken()
+{
+    return Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLower();
+}
+
+// A refusal the web client can show: it reads the "error" text out of the body.
+static IResult Error(int statusCode, string message)
+{
+    return Results.Json(new { error = message }, statusCode: statusCode);
+}
+
+// --- Supporting types ---
+
+record PlanDbConfig(string ConnectionString);
+
+record RateLimiters(RateLimiter Share, RateLimiter Analytics, RateLimiter Read);
+
+sealed class CleanupService : BackgroundService
+{
+    private readonly PlanDbConfig _config;
+    private readonly RateLimiters _rateLimiters;
+    private readonly UploadBudget _uploadBudget;
+    private readonly ILogger<CleanupService> _logger;
+
+    public CleanupService(PlanDbConfig config, RateLimiters rateLimiters, UploadBudget uploadBudget, ILogger<CleanupService> logger)
+    {
+        _config = config;
+        _rateLimiters = rateLimiters;
+        _uploadBudget = uploadBudget;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        Cleanup();
+
+        using var timer = new PeriodicTimer(TimeSpan.FromHours(1));
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            Cleanup();
+        }
+    }
+
+    private void Cleanup()
+    {
+        try
+        {
+            using var conn = new SqliteConnection(_config.ConnectionString);
+            conn.Open();
+
+            // Delete expired plans
+            var now = DateTime.UtcNow.ToString("o");
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM plans WHERE expires_at < @now";
+                cmd.Parameters.AddWithValue("@now", now);
+                var deleted = cmd.ExecuteNonQuery();
+                if (deleted > 0)
+                    _logger.LogInformation("Cleaned up {Count} expired plans", deleted);
+            }
+
+            // Delete page views older than 90 days
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM page_views WHERE created_at < @cutoff";
+                cmd.Parameters.AddWithValue("@cutoff", DateTime.UtcNow.AddDays(-90).ToString("o"));
+                var deleted = cmd.ExecuteNonQuery();
+                if (deleted > 0)
+                    _logger.LogInformation("Cleaned up {Count} old page views", deleted);
+            }
+
+            // Evict stale rate-limiter keys so the dictionaries don't grow forever.
+            // Every limiter must be swept here: an unswept one keeps a permanent
+            // entry per unique client IP for the lifetime of the process. The upload
+            // budget is swept the same way (its entries go stale at the UTC day change).
+            var shareEvicted = _rateLimiters.Share.Sweep();
+            var analyticsEvicted = _rateLimiters.Analytics.Sweep();
+            var readEvicted = _rateLimiters.Read.Sweep();
+            var budgetEvicted = _uploadBudget.Sweep();
+            if (shareEvicted + analyticsEvicted + readEvicted + budgetEvicted > 0)
+                _logger.LogInformation(
+                    "Evicted {Share} share + {Analytics} analytics + {Read} read rate-limit keys and {Budget} upload-budget keys",
+                    shareEvicted, analyticsEvicted, readEvicted, budgetEvicted);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during cleanup");
+        }
+    }
+}
+
+sealed class RateLimiter
+{
+    private readonly int _maxRequests;
+    private readonly int _windowSeconds;
+    private readonly ConcurrentDictionary<string, List<DateTime>> _requests = new();
+
+    public RateLimiter(int maxRequests, int windowSeconds)
+    {
+        _maxRequests = maxRequests;
+        _windowSeconds = windowSeconds;
+    }
+
+    public bool IsAllowed(string key)
+    {
+        var now = DateTime.UtcNow;
+        var cutoff = now.AddSeconds(-_windowSeconds);
+
+        var timestamps = _requests.GetOrAdd(key, _ => new List<DateTime>());
+
+        lock (timestamps)
+        {
+            timestamps.RemoveAll(t => t < cutoff);
+
+            if (timestamps.Count >= _maxRequests)
+            {
+                return false;
+            }
+
+            timestamps.Add(now);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Evicts keys whose timestamp lists have gone empty. Call periodically
+    /// so the dictionary doesn't grow forever across unique IPs.
+    /// Returns the number of keys evicted.
+    /// </summary>
+    public int Sweep()
+    {
+        var cutoff = DateTime.UtcNow.AddSeconds(-_windowSeconds);
+        var evicted = 0;
+        foreach (var kvp in _requests)
+        {
+            lock (kvp.Value)
+            {
+                kvp.Value.RemoveAll(t => t < cutoff);
+                if (kvp.Value.Count == 0 && _requests.TryRemove(kvp))
+                    evicted++;
+            }
+        }
+        return evicted;
+    }
+}

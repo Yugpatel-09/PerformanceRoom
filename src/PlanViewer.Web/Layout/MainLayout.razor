@@ -1,0 +1,36 @@
+@inherits LayoutComponentBase
+
+<header>
+    <div class="header-content">
+        <a href="https://github.com/Yugpatel-09" target="_blank" rel="noopener"><img src="darling-data-logo.jpg" alt="Performance Room" class="header-logo" /></a>
+        <span class="header-divider"></span>
+        <span class="header-title">Free SQL Server Query Plan Analysis</span>
+        <nav class="header-nav">
+            <a href="https://Yug Patel/blog/" target="_blank" rel="noopener">Blog</a>
+            <a href="https://training.Yug Patel/sqlconsulting" target="_blank" rel="noopener">Consulting</a>
+            <a href="https://training.Yug Patel/catalog" target="_blank" rel="noopener">Training</a>
+            <a href="https://training.Yug Patel/sql-monitoring" target="_blank" rel="noopener">Monitoring</a>
+            <a href="https://Yug Patel/request-a-call/" target="_blank" rel="noopener">Request a Call</a>
+        </nav>
+    </div>
+</header>
+
+<main>
+    <ErrorBoundary>
+        <ChildContent>
+            @Body
+        </ChildContent>
+        <ErrorContent>
+            <p class="error-message">Something went wrong. Please refresh the page and try again.</p>
+        </ErrorContent>
+    </ErrorBoundary>
+</main>
+
+<footer>
+    <div>Copyright &copy; 2019-@DateTime.Now.Year Yug Patel</div>
+    <div class="footer-links">
+        <a href="https://github.com/Yugpatel-09" target="_blank" rel="noopener">Yug Patel</a>
+        <span class="footer-sep">&middot;</span>
+        <a href="https://github.com/Yugpatel-09/PerformanceRoom" target="_blank" rel="noopener">GitHub</a>
+    </div>
+</footer>

@@ -1,0 +1,68 @@
+using Microsoft.Data.SqlClient;
+
+namespace PlanViewer.Cli;
+
+public static class ConnectionHelper
+{
+    public static string BuildConnectionString(
+        string server, string database, string login, string password,
+        bool trustCert, bool multipleActiveResultSets = false)
+    {
+        var builder = new SqlConnectionStringBuilder
+        {
+            DataSource = server,
+            InitialCatalog = database,
+            UserID = login,
+            Password = password,
+            ApplicationName = "PlanViewer",
+            ConnectTimeout = 15,
+            TrustServerCertificate = trustCert,
+            // Keep encryption mandatory regardless of --trust-cert. --trust-cert only
+            // skips certificate *validation* (for self-signed certs); it must not also
+            // drop the connection to optional/plaintext, which would allow a MITM.
+            Encrypt = SqlConnectionEncryptOption.Mandatory
+        };
+
+        if (multipleActiveResultSets)
+            builder.MultipleActiveResultSets = true;
+
+        return builder.ConnectionString;
+    }
+
+    public static EnvFile LoadEnvFile() => LoadEnvFile(Directory.GetCurrentDirectory());
+
+    public static EnvFile LoadEnvFile(string directory)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var envPath = Path.GetFullPath(Path.Combine(directory, ".env"));
+
+        if (!File.Exists(envPath))
+            return new EnvFile(null, result);
+
+        foreach (var line in File.ReadAllLines(envPath))
+        {
+            var trimmed = line.Trim();
+            if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith('#'))
+                continue;
+
+            var eqIndex = trimmed.IndexOf('=');
+            if (eqIndex <= 0)
+                continue;
+
+            var key = trimmed[..eqIndex].Trim();
+            var value = trimmed[(eqIndex + 1)..].Trim();
+
+            // Strip surrounding quotes
+            if (value.Length >= 2 &&
+                ((value.StartsWith('"') && value.EndsWith('"')) ||
+                 (value.StartsWith('\'') && value.EndsWith('\''))))
+            {
+                value = value[1..^1];
+            }
+
+            result[key] = value;
+        }
+
+        return new EnvFile(envPath, result);
+    }
+}

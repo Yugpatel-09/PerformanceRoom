@@ -1,0 +1,510 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="using:PlanViewer.App.Controls"
+             xmlns:helpers="using:PlanViewer.App.Helpers"
+             xmlns:models="using:PlanViewer.Core.Models"
+             x:Class="PlanViewer.App.Controls.QueryStoreGridControl"
+             Background="{DynamicResource BackgroundBrush}">
+    <Grid RowDefinitions="Auto,Auto,Auto,Auto,*">
+        <!-- Time Range Slicer + Wait Stats Profile -->
+        <Grid Grid.Row="0" x:Name="SlicerRow" ColumnDefinitions="2*,Auto,*">
+            <local:TimeRangeSlicerControl x:Name="TimeRangeSlicer" Grid.Column="0"/>
+            <!-- Resizable separator with chevron overlay -->
+            <GridSplitter x:Name="WaitStatsSplitter" Grid.Column="1" Width="14"
+                          Background="{DynamicResource BorderBrush}"
+                          ResizeDirection="Columns"/>
+            <Button x:Name="WaitStatsChevronButton" Grid.Column="1"
+                    Content="»"
+                    Width="14" Height="28" Padding="0"
+                    FontSize="11" FontWeight="Bold"
+                    Background="Transparent" BorderThickness="0"
+                    Foreground="{DynamicResource ForegroundBrush}"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Center"
+                    IsHitTestVisible="True"
+                    ToolTip.Tip="Collapse / expand wait stats panel"
+                    Click="WaitStatsChevron_Click"/>
+            <local:WaitStatsProfileControl x:Name="WaitStatsProfile" Grid.Column="2"/>
+        </Grid>
+
+        <!-- Toolbar -->
+        <Border Grid.Row="1" Background="{DynamicResource BackgroundDarkBrush}" Padding="8,6"
+                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1">
+            <StackPanel Orientation="Horizontal" Spacing="12">
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Database" Foreground="{DynamicResource ForegroundBrush}" FontSize="11"/>
+                    <ComboBox x:Name="QsDatabaseBox" Width="200" Height="36" FontSize="13"
+                              SelectionChanged="QsDatabase_SelectionChanged"/>
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <Button x:Name="SelectToggleButton" Content="Select All" Click="SelectToggle_Click"
+                                Height="24" Padding="8,0" FontSize="11"
+                                Theme="{StaticResource AppButton}"/>
+                        <Button x:Name="LoadButton" Content="Load Selected" Click="LoadSelected_Click"
+                                Height="24" Padding="8,0" FontSize="11" IsEnabled="False"
+                                Theme="{StaticResource AppButton}"/>
+                    </StackPanel>
+                </StackPanel>
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Top N" Foreground="{DynamicResource ForegroundBrush}" FontSize="11"/>
+                    <NumericUpDown x:Name="TopNBox" Value="25" Minimum="1" Maximum="100"
+                                   Width="120" Height="36" FontSize="14" FormatString="0"
+                                   HorizontalContentAlignment="Center"/>
+                </StackPanel>
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Order by" Foreground="{DynamicResource ForegroundBrush}" FontSize="11"/>
+                    <ComboBox x:Name="OrderByBox" Width="160" Height="36" FontSize="13"
+                              SelectedIndex="0" SelectionChanged="OrderBy_SelectionChanged">
+                        <ComboBoxItem Content="Total CPU" Tag="cpu"/>
+                        <ComboBoxItem Content="Avg CPU" Tag="avg-cpu"/>
+                        <ComboBoxItem Content="Total Duration" Tag="duration"/>
+                        <ComboBoxItem Content="Avg Duration" Tag="avg-duration"/>
+                        <ComboBoxItem Content="Total Reads" Tag="reads"/>
+                        <ComboBoxItem Content="Avg Reads" Tag="avg-reads"/>
+                        <ComboBoxItem Content="Total Writes" Tag="writes"/>
+                        <ComboBoxItem Content="Avg Writes" Tag="avg-writes"/>
+                        <ComboBoxItem Content="Total Physical Reads" Tag="physical-reads"/>
+                        <ComboBoxItem Content="Avg Physical Reads" Tag="avg-physical-reads"/>
+                        <ComboBoxItem Content="Total Memory" Tag="memory"/>
+                        <ComboBoxItem Content="Avg Memory" Tag="avg-memory"/>
+                        <ComboBoxItem Content="Executions" Tag="executions"/>
+                    </ComboBox>
+                </StackPanel>
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Group by" Foreground="{DynamicResource ForegroundBrush}" FontSize="11"/>
+                    <ComboBox x:Name="GroupByBox" Width="130" Height="36" FontSize="13"
+                              SelectedIndex="1" SelectionChanged="GroupBy_SelectionChanged">
+                        <ComboBoxItem Content="None" Tag="none"/>
+                        <ComboBoxItem Content="Query Hash" Tag="query-hash"/>
+                        <ComboBoxItem Content="Module" Tag="module"/>
+                    </ComboBox>
+                </StackPanel>
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Search by" Foreground="{DynamicResource ForegroundBrush}" FontSize="11"/>
+                    <ComboBox x:Name="SearchTypeBox" Width="140" Height="36" FontSize="13"
+                              SelectedIndex="0" SelectionChanged="SearchType_SelectionChanged">
+                        <ComboBoxItem Content="(none)" Tag=""/>
+                        <ComboBoxItem Content="Query ID" Tag="query-id"/>
+                        <ComboBoxItem Content="Plan ID" Tag="plan-id"/>
+                        <ComboBoxItem Content="Query Hash" Tag="query-hash"/>
+                        <ComboBoxItem Content="Plan Hash" Tag="plan-hash"/>
+                        <ComboBoxItem Content="Module" Tag="module"/>
+                        <ComboBoxItem Content="Query Text" Tag="query-text"/>
+                        <ComboBoxItem Content="Execution Type" Tag="execution-type"/>
+                    </ComboBox>
+                </StackPanel>
+                <StackPanel x:Name="SearchValuePanel" Spacing="4">
+                    <TextBlock Text=" " FontSize="11"/>
+                    <TextBox x:Name="SearchValueBox" Width="200" Height="36" FontSize="13"
+                             PlaceholderText="0x1AB2C3, dbo.MyProc"
+                             KeyDown="SearchValue_KeyDown"/>
+                </StackPanel>
+                <StackPanel x:Name="ExecutionTypePanel" Spacing="4" IsVisible="False">
+                    <TextBlock Text="Execution Type" Foreground="{DynamicResource ForegroundBrush}" FontSize="11"/>
+                    <ComboBox x:Name="ExecutionTypeBox" Width="120" Height="36" FontSize="13"
+                              SelectedIndex="0">
+                        <ComboBoxItem Content="(any)" Tag="any"/>
+                        <ComboBoxItem Content="Regular" Tag="Regular"/>
+                        <ComboBoxItem Content="Aborted" Tag="Aborted"/>
+                        <ComboBoxItem Content="Exception" Tag="Exception"/>
+                        <ComboBoxItem Content="Failed" Tag="Failed"/>
+                    </ComboBox>
+                </StackPanel>
+                <StackPanel Spacing="4">
+                    <TextBlock Text="Time display" Foreground="{DynamicResource ForegroundBrush}" FontSize="11"/>
+                    <ComboBox x:Name="TimeDisplayBox" Width="100" Height="36" FontSize="13"
+                              SelectedIndex="0" SelectionChanged="TimeDisplay_SelectionChanged">
+                        <ComboBoxItem Content="Local" Tag="Local"/>
+                        <ComboBoxItem Content="UTC" Tag="Utc"/>
+                        <ComboBoxItem Content="Server" Tag="Server"/>
+                    </ComboBox>
+                </StackPanel>
+                <StackPanel Spacing="2" VerticalAlignment="Center">
+                    <Button x:Name="FetchButton" Content="Fetch" Click="Fetch_Click"
+                            Height="28" Padding="16,0" FontSize="12"
+                            Theme="{StaticResource AppButton}"/>
+                </StackPanel>
+                <StackPanel Spacing="2" VerticalAlignment="Center">
+                    <Button x:Name="ClearSearchButton" Content="Clear" Click="ClearSearch_Click"
+                            Height="28" Padding="10,0" FontSize="12"
+                            Theme="{StaticResource AppButton}"/>
+                </StackPanel>
+                <TextBlock x:Name="StatusText" VerticalAlignment="Center"
+                           FontSize="12" Foreground="{DynamicResource ForegroundBrush}"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Server Filters panel (collapsible) -->
+        <Border Grid.Row="2" Background="{DynamicResource BackgroundDarkBrush}"
+                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1">
+            <Expander x:Name="ServerFilterExpander" IsExpanded="False"
+                      Foreground="{DynamicResource ForegroundBrush}"
+                      Background="Transparent"
+                      BorderThickness="0"
+                      Padding="0"
+                      HorizontalAlignment="Stretch"
+                      HorizontalContentAlignment="Stretch">
+                <Expander.Header>
+                    <TextBlock Text="  Server Filters" FontWeight="SemiBold"
+                               Foreground="{DynamicResource ForegroundBrush}"/>
+                </Expander.Header>
+                <StackPanel Margin="12,6" Spacing="10">
+                    <!-- Row A: numeric thresholds -->
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Min executions" FontSize="11"
+                                       Foreground="{DynamicResource ForegroundBrush}"/>
+                            <NumericUpDown x:Name="MinExecBox" Minimum="0" Width="130" Height="32" FormatString="0"/>
+                        </StackPanel>
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Min avg CPU (ms)" FontSize="11"
+                                       Foreground="{DynamicResource ForegroundBrush}"/>
+                            <NumericUpDown x:Name="MinCpuBox" Minimum="0" Width="130" Height="32" FormatString="0"/>
+                        </StackPanel>
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Min avg duration (ms)" FontSize="11"
+                                       Foreground="{DynamicResource ForegroundBrush}"/>
+                            <NumericUpDown x:Name="MinDurBox" Minimum="0" Width="130" Height="32" FormatString="0"/>
+                        </StackPanel>
+                    </StackPanel>
+                    <!-- Row B: query text search -->
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Query text contains" FontSize="11"
+                                       Foreground="{DynamicResource ForegroundBrush}"/>
+                            <TextBox x:Name="TextSearchBox" Width="220" Height="32" PlaceholderText="e.g. Votes"/>
+                        </StackPanel>
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Query text excludes" FontSize="11"
+                                       Foreground="{DynamicResource ForegroundBrush}"/>
+                            <TextBox x:Name="TextExcludeBox" Width="220" Height="32" PlaceholderText="e.g. #temp"/>
+                        </StackPanel>
+                        <CheckBox x:Name="EscapeBracketsBox" Content="Treat [ ] __ as literals"
+                                  VerticalAlignment="Bottom"
+                                  Foreground="{DynamicResource ForegroundBrush}"/>
+                    </StackPanel>
+                    <!-- Row C: id lists -->
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Include query IDs" FontSize="11"
+                                       Foreground="{DynamicResource ForegroundBrush}"/>
+                            <TextBox x:Name="IncludeQueryIdsBox" Width="180" Height="32" PlaceholderText="1, 2, 3"/>
+                        </StackPanel>
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Ignore query IDs" FontSize="11"
+                                       Foreground="{DynamicResource ForegroundBrush}"/>
+                            <TextBox x:Name="IgnoreQueryIdsBox" Width="180" Height="32" PlaceholderText="4, 5"/>
+                        </StackPanel>
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Include plan IDs" FontSize="11"
+                                       Foreground="{DynamicResource ForegroundBrush}"/>
+                            <TextBox x:Name="IncludePlanIdsBox" Width="180" Height="32" PlaceholderText="10, 11"/>
+                        </StackPanel>
+                        <StackPanel Spacing="2">
+                            <TextBlock Text="Ignore plan IDs" FontSize="11"
+                                       Foreground="{DynamicResource ForegroundBrush}"/>
+                            <TextBox x:Name="IgnorePlanIdsBox" Width="180" Height="32" PlaceholderText="12"/>
+                        </StackPanel>
+                    </StackPanel>
+                    <!-- Actions -->
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+                        <Button Content="Clear filters" Click="ClearServerFilters_Click"
+                                Height="28" FontSize="12" Theme="{StaticResource AppButton}"/>
+                        <Button Content="Apply &amp; Fetch" Click="ApplyServerFilters_Click"
+                                Height="28" FontSize="12" Theme="{StaticResource AppButton}"/>
+                    </StackPanel>
+                </StackPanel>
+            </Expander>
+        </Border>
+
+        <!-- Active server-filter chips -->
+        <Border Grid.Row="3" x:Name="ChipStrip" IsVisible="False"
+                Background="{DynamicResource BackgroundDarkBrush}"
+                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1"
+                Padding="8,4">
+            <ItemsControl x:Name="ChipItems">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <WrapPanel Orientation="Horizontal"/>
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="models:ServerFilterChip">
+                        <Border Background="{DynamicResource BackgroundLightBrush}"
+                                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
+                                CornerRadius="10" Padding="8,2" Margin="0,2,6,2">
+                            <StackPanel Orientation="Horizontal" Spacing="4">
+                                <TextBlock Text="{Binding Label}" FontSize="11"
+                                           VerticalAlignment="Center"
+                                           Foreground="{DynamicResource ForegroundBrush}"/>
+                                <Button Content="✕" Tag="{Binding Kind}" Click="ChipRemove_Click"
+                                        Width="16" Height="16" Padding="0" FontSize="10"
+                                        Background="Transparent" BorderThickness="0"
+                                        Foreground="{DynamicResource ForegroundMutedBrush}"/>
+                            </StackPanel>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </Border>
+
+        <!-- DataGrid + loading overlay -->
+        <Grid Grid.Row="4">
+        <DataGrid x:Name="ResultsGrid"
+                  AutoGenerateColumns="False"
+                  CanUserSortColumns="True"
+                  CanUserReorderColumns="True"
+                  CanUserResizeColumns="True"
+                  IsReadOnly="True"
+                  SelectionMode="Single"
+                  GridLinesVisibility="Horizontal"
+                  HeadersVisibility="Column"
+                  FontSize="11"
+                  Background="{DynamicResource BackgroundDarkBrush}"
+                  BorderThickness="0"
+                  Sorting="ResultsGrid_Sorting"
+                  DoubleTapped="ResultsGrid_DoubleTapped"
+                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+            <DataGrid.ContextMenu>
+                <ContextMenu Opening="ContextMenu_Opening">
+                    <MenuItem Header="Load Plan" Click="LoadHighlightedPlan_Click"/>
+                    <MenuItem x:Name="ViewHistoryItem" Header="View History" Click="ViewHistory_Click"/>
+                    <Separator/>
+                    <MenuItem x:Name="CopyQueryIdItem" Header="Copy Query ID"/>
+                    <MenuItem x:Name="CopyPlanIdItem" Header="Copy Plan ID"/>
+                    <MenuItem x:Name="CopyQueryHashItem" Header="Copy Query Hash"/>
+                    <MenuItem x:Name="CopyPlanHashItem" Header="Copy Plan Hash"/>
+                    <MenuItem x:Name="CopyModuleItem" Header="Copy Module Name"/>
+                    <Separator/>
+                    <MenuItem x:Name="CopyQueryTextItem" Header="Copy Query Text"/>
+                    <MenuItem x:Name="CopyRowItem" Header="Copy Row"/>
+                </ContextMenu>
+            </DataGrid.ContextMenu>
+            <DataGrid.Columns>
+                <DataGridTemplateColumn Header="" Width="220" IsVisible="True">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <StackPanel Orientation="Horizontal" Margin="{Binding IndentMargin}"
+                                        VerticalAlignment="Stretch">
+                                <Button Content="{Binding ExpandChevron}"
+                                        IsVisible="{Binding HasChildren}"
+                                        MinWidth="20" Padding="2,0"
+                                        FontSize="18" FontWeight="Bold"
+                                        Background="Transparent" BorderThickness="0"
+                                        Foreground="{DynamicResource ForegroundBrush}"
+                                        VerticalAlignment="Stretch"
+                                        VerticalContentAlignment="Center"
+                                        Click="ExpandRow_Click"/>
+                                <TextBlock Text="{Binding GroupDisplayText}"
+                                           VerticalAlignment="Center"
+                                           Margin="4,0,0,0"
+                                           FontWeight="{Binding GroupFontWeight}"
+                                           Foreground="{DynamicResource ForegroundBrush}"
+                                           TextTrimming="CharacterEllipsis"/>
+                            </StackPanel>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="" Width="40">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <CheckBox IsChecked="{Binding IsSelected}" HorizontalAlignment="Center"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTextColumn Header="QueryId" Binding="{ReflectionBinding QueryIdDisplay}" SortMemberPath="QueryId" Width="90"/>
+                <DataGridTextColumn Header="PlanId" Binding="{ReflectionBinding PlanIdDisplay}" SortMemberPath="PlanId" Width="80"/>
+                <DataGridTextColumn Header="Query Hash" Binding="{ReflectionBinding QueryHash}" SortMemberPath="QueryHash" Width="150"/>
+                <DataGridTextColumn Header="Plan Hash" Binding="{ReflectionBinding QueryPlanHash}" SortMemberPath="QueryPlanHash" Width="150"/>
+                <DataGridTextColumn Header="Module" Binding="{ReflectionBinding ModuleName}" SortMemberPath="ModuleName" Width="140"/>
+                <DataGridTemplateColumn SortMemberPath="WaitGrandTotalSort" Width="160">
+                    <DataGridTemplateColumn.Header>
+                        <StackPanel Orientation="Horizontal" Spacing="4">
+                            <Button Content="v" Width="20" Height="18" Padding="0"
+                                    FontSize="10" FontWeight="Bold"
+                                    Background="Transparent" BorderThickness="1"
+                                    BorderBrush="{DynamicResource ForegroundMutedBrush}"
+                                    Foreground="{DynamicResource ForegroundBrush}"
+                                    ToolTip.Tip="Toggle value (v) / percent (%) stacked bar"
+                                    Click="WaitModeToggle_Click"/>
+                            <TextBlock Text="Wait Profile" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </DataGridTemplateColumn.Header>
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:WaitProfileBarControl Height="14" Margin="2,1"
+                                                         Profile="{Binding WaitProfile}"
+                                                         HighlightCategory="{Binding WaitHighlightCategory}"
+                                                         PercentMode="{Binding WaitPercentMode}"
+                                                         MaxGrandTotalRatio="{Binding WaitMaxGrandTotal}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTextColumn Header="Last Executed" Binding="{ReflectionBinding LastExecutedLocal}" SortMemberPath="LastExecutedLocal" Width="160"/>
+                <DataGridTemplateColumn Header="Executions" SortMemberPath="ExecsSort" Width="105">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding ExecsDisplay}"
+                                               Ratio="{Binding ExecsRatio}"
+                                               ColumnId="Executions"
+                                               IsSortedColumn="{Binding IsSortedColumn_Executions}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Total CPU (ms)" SortMemberPath="TotalCpuSort" Width="135">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding TotalCpuDisplay}"
+                                               Ratio="{Binding TotalCpuRatio}"
+                                               ColumnId="TotalCpu"
+                                               IsSortedColumn="{Binding IsSortedColumn_TotalCpu}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Avg CPU (ms)" SortMemberPath="AvgCpuSort" Width="120">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding AvgCpuDisplay}"
+                                               Ratio="{Binding AvgCpuRatio}"
+                                               ColumnId="AvgCpu"
+                                               IsSortedColumn="{Binding IsSortedColumn_AvgCpu}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Total Duration (ms)" SortMemberPath="TotalDurSort" Width="165">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding TotalDurDisplay}"
+                                               Ratio="{Binding TotalDurRatio}"
+                                               ColumnId="TotalDuration"
+                                               IsSortedColumn="{Binding IsSortedColumn_TotalDuration}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Avg Duration (ms)" SortMemberPath="AvgDurSort" Width="155">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding AvgDurDisplay}"
+                                               Ratio="{Binding AvgDurRatio}"
+                                               ColumnId="AvgDuration"
+                                               IsSortedColumn="{Binding IsSortedColumn_AvgDuration}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Total Reads" SortMemberPath="TotalReadsSort" Width="100">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding TotalReadsDisplay}"
+                                               Ratio="{Binding TotalReadsRatio}"
+                                               ColumnId="TotalReads"
+                                               IsSortedColumn="{Binding IsSortedColumn_TotalReads}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Avg Reads" SortMemberPath="AvgReadsSort" Width="100">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding AvgReadsDisplay}"
+                                               Ratio="{Binding AvgReadsRatio}"
+                                               ColumnId="AvgReads"
+                                               IsSortedColumn="{Binding IsSortedColumn_AvgReads}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Total Writes" SortMemberPath="TotalWritesSort" Width="100">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding TotalWritesDisplay}"
+                                               Ratio="{Binding TotalWritesRatio}"
+                                               ColumnId="TotalWrites"
+                                               IsSortedColumn="{Binding IsSortedColumn_TotalWrites}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Avg Writes" SortMemberPath="AvgWritesSort" Width="100">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding AvgWritesDisplay}"
+                                               Ratio="{Binding AvgWritesRatio}"
+                                               ColumnId="AvgWrites"
+                                               IsSortedColumn="{Binding IsSortedColumn_AvgWrites}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Total Phys Reads" SortMemberPath="TotalPhysReadsSort" Width="140">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding TotalPhysReadsDisplay}"
+                                               Ratio="{Binding TotalPhysReadsRatio}"
+                                               ColumnId="TotalPhysReads"
+                                               IsSortedColumn="{Binding IsSortedColumn_TotalPhysReads}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Avg Phys Reads" SortMemberPath="AvgPhysReadsSort" Width="130">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding AvgPhysReadsDisplay}"
+                                               Ratio="{Binding AvgPhysReadsRatio}"
+                                               ColumnId="AvgPhysReads"
+                                               IsSortedColumn="{Binding IsSortedColumn_AvgPhysReads}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Total Memory (MB)" SortMemberPath="TotalMemSort" Width="155">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding TotalMemDisplay}"
+                                               Ratio="{Binding TotalMemRatio}"
+                                               ColumnId="TotalMemory"
+                                               IsSortedColumn="{Binding IsSortedColumn_TotalMemory}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Avg Memory (MB)" SortMemberPath="AvgMemSort" Width="145">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <local:BarChartCell DisplayText="{Binding AvgMemDisplay}"
+                                               Ratio="{Binding AvgMemRatio}"
+                                               ColumnId="AvgMemory"
+                                               IsSortedColumn="{Binding IsSortedColumn_AvgMemory}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="Query Text" Width="300" MinWidth="300">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate x:DataType="local:QueryStoreRow">
+                            <TextBlock Text="{Binding QueryPreview}"
+                                       TextTrimming="CharacterEllipsis"
+                                       VerticalAlignment="Center"
+                                       ToolTip.Tip="{Binding FullQueryText}"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTextColumn Header="Execution Type" Binding="{ReflectionBinding ExecutionTypeDesc}" SortMemberPath="ExecutionTypeDesc" Width="110"/>
+            </DataGrid.Columns>
+        </DataGrid>
+        <!-- Loading overlay -->
+        <Border x:Name="GridLoadingOverlay" IsVisible="False"
+                Background="#80000000" CornerRadius="0"
+                HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8">
+                <ProgressBar IsIndeterminate="True" Width="200" Height="4"
+                             helpers:ProgressBarBehaviors.RestartOnReattach="True"/>
+                <TextBlock x:Name="GridLoadingText" Text="Fetching plans..."
+                           FontSize="12" HorizontalAlignment="Center"
+                           Foreground="{DynamicResource ForegroundBrush}"/>
+            </StackPanel>
+        </Border>
+        <!-- Empty-state overlay (Module groupby with no module data) -->
+        <Border x:Name="GridEmptyMessage" IsVisible="False"
+                HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                IsHitTestVisible="False">
+            <TextBlock x:Name="GridEmptyMessageText"
+                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                       FontSize="20" FontWeight="SemiBold"
+                       Foreground="{DynamicResource ForegroundMutedBrush}"
+                       TextAlignment="Center"/>
+        </Border>
+        </Grid>
+    </Grid>
+</UserControl>

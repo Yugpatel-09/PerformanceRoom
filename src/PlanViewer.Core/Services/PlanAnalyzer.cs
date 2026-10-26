@@ -1,0 +1,168 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+using PlanViewer.Core.Models;
+
+namespace PlanViewer.Core.Services;
+
+/// <summary>
+/// Post-parse analysis pass that walks a parsed plan tree and adds warnings
+/// for common performance anti-patterns. Called after ShowPlanParser.Parse().
+/// </summary>
+public static partial class PlanAnalyzer
+{
+    /* Plan XML can come from anywhere, so a predicate or a statement can be millions of characters
+       long. The patterns below marked NonBacktracking read up to a closing bracket, quote or
+       keyword. When that is missing, the default engine reads from every possible start to the
+       end of the text, which takes time in proportion to the square of its length. The
+       NonBacktracking engine finds the same matches in time that grows only in step with the
+       length. It has no lookarounds, so
+       ComparisonOperatorRegex keeps the default engine; its matches are at most two characters
+       long, so it is linear already. */
+    private static readonly Regex FunctionInPredicateRegex = new(
+        @"\b(CONVERT_IMPLICIT|CONVERT|CAST|isnull|coalesce|datepart|datediff|dateadd|year|month|day|upper|lower|ltrim|rtrim|trim|substring|left|right|charindex|replace|len|datalength|abs|floor|ceiling|round|reverse|stuff|format)\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex LeadingWildcardLikeRegex = new(
+        @"\blike\b[^'""]*?N?'%",
+        RegexOptions.IgnoreCase | RegexOptions.NonBacktracking);
+
+    private static readonly Regex CaseInPredicateRegex = new(
+        @"\bCASE\s+(WHEN\b|$)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex ConvertImplicitRegex = new(
+        @"\bCONVERT_IMPLICIT\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /* A column reference in a ScalarString is multi-part bracket-qualified ([schema].[table]).
+       A variable is a single bracket pair with an @ prefix ([@0]) and no dotted part after it —
+       the "].[" sequence is what separates the two, NOT the @. A bare [@p] cannot match, because
+       nothing dotted follows it.
+
+       A table-variable column is dotted only through its alias: SELECT v.X FROM @tv AS v WHERE
+       ABS(v.X) = 1 gives "abs(@tv.[X] as [v].[X])=(1)", and [v].[X] matches. With no alias it is
+       a bare name: SELECT X FROM @tv WHERE ABS(X) = 1 gives "abs([X])=(1)". Checked on SQL Server
+       2016, 2017, 2019, 2022 and 2025, and none of them renders [@tv].[col]. A bare name has the
+       same shape as a parameter or an expression, so this regex never reads one as a column.
+       IsColumnReference (#561) can, when the caller has identified the scan: a bare name on an
+       unaliased table variable's own scan is a column, unless it is a bare outer reference passed
+       in from another unaliased table variable one row at a time (#564) — that one looks exactly
+       the same and this regex could never have told the two apart either. */
+    private static readonly Regex ColumnReferenceRegex = new(
+        @"\[[^\]]+\]\.\[",
+        RegexOptions.NonBacktracking);
+
+    /* An optimizer-generated expression name in a ScalarString ([Expr1003]) — a computed value,
+       never an actual column, even on a table variable scan where a bare name is otherwise read
+       as a column (#561). Matched against BracketedNameRegex's whole name group, so it only ever
+       sees a single bracket part or a dotted chain, never raw predicate text. */
+    private static readonly Regex ExpressionColumnRegex = new(
+        @"^\[Expr\d+\]$",
+        RegexOptions.Compiled);
+
+    /* One bracket part of a name BracketedNameRegex already matched whole — [schema], [table],
+       [col], each on its own — so IsColumnReference (#564) can split "[db].[schema].[table].[col]"
+       or "[alias].[col]" into parts and read off the one right before the column, the owner. Reused
+       rather than a plain Split on "].[", so an identifier carrying an escaped "]]" still splits in
+       the right place. */
+    private static readonly Regex NamePartRegex = new(
+        @"\[(?:[^\]]|\]\])*\]",
+        RegexOptions.NonBacktracking);
+
+    /* The operator a comparison turns on in a ScalarString: >=, <=, <>, !=, >, <, = or like.
+       Without like, [col] like upper([@p]) had no operator at all, fell to the assume-the-worst
+       default, and a function on the pattern was reported as a function on the column. */
+    private static readonly Regex ComparisonOperatorRegex = new(
+        @"(?<![<>])([<>=!]{1,2})(?![<>=])|\s(like)\s",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /* What joins one comparison to the next in a compound predicate. String literals and
+       bracketed identifiers are matched first, so an AND inside one of them (N'Tom AND Jerry',
+       [Terms and Conditions]) is consumed whole and never reaches the capture group. Only a
+       Groups[1] match is a real operator. */
+    private static readonly Regex LogicalOperatorRegex = new(
+        @"'(?:[^']|'')*'|\[(?:[^\]]|\]\])*\]|\s(AND|OR)\s",
+        RegexOptions.IgnoreCase | RegexOptions.NonBacktracking);
+
+    private static readonly Regex IsnullCoalesceRegex = new(
+        @"\b(isnull|coalesce)\s*\(",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /* A name in a ScalarString: one bracketed part or a dotted chain of them ([@p1], [Expr1003],
+       [db].[dbo].[T].[c]). A name followed by ( is a function call. String literals are matched
+       first, so a bracket inside one ('[x]') is never read as a name. Only a match with the
+       name group is a name. */
+    private static readonly Regex BracketedNameRegex = new(
+        @"'(?:[^']|'')*'|(?<name>\[(?:[^\]]|\]\])*\](?:\.\[(?:[^\]]|\]\])*\])*)(?<call>\s*\()?",
+        RegexOptions.NonBacktracking);
+
+    public static void Analyze(ParsedPlan plan, AnalyzerConfig? config = null, ServerMetadata? serverMetadata = null) =>
+        AnalyzeCancellable(plan, config, serverMetadata, CancellationToken.None);
+
+    internal static void AnalyzeCancellable(
+        ParsedPlan plan,
+        AnalyzerConfig? config,
+        ServerMetadata? serverMetadata,
+        CancellationToken cancellationToken)
+    {
+        var cfg = config ?? AnalyzerConfig.Default;
+        {
+            /* #455: every statement, including the ones inside a stored procedure or UDF body. This
+               used to walk batch.Statements alone, so an EXEC <procedure> plan analyzed as a single
+               statement with nothing to say about it. */
+            foreach (var stmt in PlanStatements.EnumerateAll(plan))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                AnalyzeStatement(stmt, cfg, serverMetadata);
+
+                if (stmt.RootNode != null)
+                    AnalyzeNodeTree(stmt.RootNode, stmt, cfg, cancellationToken);
+
+                cancellationToken.ThrowIfCancellationRequested();
+                MarkLegacyWarnings(stmt);
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        // Apply severity overrides to all warnings
+        if (cfg.Rules?.SeverityOverrides?.Count > 0)
+            ApplySeverityOverrides(plan, cfg);
+    }
+
+    /// <summary>
+    /// Rule types that predate the benefit-scoring framework (#215) and haven't
+    /// been folded into A/B/C/D categorization yet. Tagged so reviewers can hold
+    /// new-framework items to a higher bar vs known-legacy items that will be
+    /// reworked later. Remove entries from this set as rules migrate.
+    /// </summary>
+    private static readonly HashSet<string> LegacyWarningTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Excessive Memory Grant",
+        "Large Memory Grant",
+        "Compile Memory Exceeded",
+        "Local Variables",
+        "Optimize For Unknown",
+        "Low Impact Index",
+        "Wide Index Suggestion",
+        "Duplicate Index Suggestions",
+        "Table Variable",
+        "Scalar UDF",
+        "Parallel Skew",
+        "Estimated Plan CE Guess",
+        "Data Type Mismatch",
+        "Lazy Spool Ineffective",
+        "Join OR Clause",
+        "Many-to-Many Merge Join",
+        "Table-Valued Function",
+        "Top Above Scan",
+        "Row Goal",
+        "NOT IN with Nullable Column",
+        "Implicit Conversion",
+    };
+
+    private record ScanImpact(double CostPct, double ElapsedPct, string? Summary);
+
+
+}

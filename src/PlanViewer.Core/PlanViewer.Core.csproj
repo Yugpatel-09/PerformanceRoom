@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>PlanViewer.Core</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" />
+    <PackageReference Include="Meziantou.Framework.Win32.CredentialManager" />
+    <PackageReference Include="Microsoft.Data.SqlClient.Extensions.Azure" />
+    <PackageReference Include="Microsoft.SqlServer.TransactSql.ScriptDom" />
+    <!-- Direct reference so the central pin (issue #650) beats SqlClient's transitive 9.0.18. -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\PlanIcons\*.png" />
+    <EmbeddedResource Include="Resources\WaitStats.json" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- App and CLI are executable hosts in this repository; keep host-only orchestration internal. -->
+    <InternalsVisibleTo Include="PlanViewer.App" />
+    <InternalsVisibleTo Include="planview" />
+    <InternalsVisibleTo Include="PlanViewer.Core.Tests" />
+  </ItemGroup>
+
+</Project>
