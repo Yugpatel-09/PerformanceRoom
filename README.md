@@ -13,6 +13,12 @@ A cross-platform SQL Server execution plan analyzer with built-in MCP server for
 
 Built for developers and DBAs who want fast, automated plan analysis without clicking through SSMS.
 
+## Fully Guided Video
+
+Watch a complete walkthrough demonstrating the features and capabilities in action:
+
+🎬 **[Watch the Fully Guided Video](https://drive.google.com/file/d/1MKB_rwrtErzSzLnSkb0c3hcAQ22eMxTo/view?usp=drive_link)**
+
 ## Screenshots
 
 ### Query Editor
